@@ -1,0 +1,11 @@
+.env
+.DS_Store
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.zip
+.venv/
+venv/
+supabase/.temp/
