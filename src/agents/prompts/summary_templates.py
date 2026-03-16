@@ -44,7 +44,67 @@ releases, and SEC filings for a specific period, produce a structured summary re
 - If you're writing a quarterly or annual summary that spans multiple months, note trends across the period, not just snapshots.
 - If no prior period data is available, omit period-over-period comparisons and note this in the data_gaps section.
 
+**Writing rules — do NOT use these words or patterns:**
+- testament, pivotal, crucial, underscores, highlights, showcasing, exemplifies, vibrant, rich, profound, intricate, meticulous, tapestry, delve, bolster, foster, garner, interplay
+- "Not just X, but also Y" constructions
+- Three-adjective groupings for rhetorical rhythm
+- "serves as", "functions as", "represents" when you mean "is"
+- Any sentence starting with "Additionally"
+- "align with", "commitment to", "enduring legacy", "focal point"
+- Avoiding simple "is"/"are" in favor of fancier verbs
+- Do not end with a "looking ahead" or "future prospects" paragraph
+Write plain, direct, numbers-first. State facts. Let the data do the work.
+
 **Output:** Return ONLY valid JSON matching the provided schema. No markdown wrapping, no code blocks, no preamble."""
+
+
+# ============================================================================
+# VERIFICATION PROMPT — reviews generated report against source data
+# ============================================================================
+
+VERIFICATION_SYSTEM = """You are a quantitative fact-checker for financial reports. You receive a generated report and the raw source data it was built from.
+
+Your job: check every number in the report against the source data. For each claim, verify:
+1. The number matches the source data exactly (within rounding tolerance of $1M or 0.1%)
+2. Period-over-period changes are arithmetically correct (current minus prior)
+3. Percentage changes use the right base (prior period value as denominator)
+4. No contradictions (e.g., "decreased from $X to $Y" where Y > X)
+5. Positions are matched correctly — "30y 5.0s" under "Conventionals" is different from "30y 5.0s" under "Ginnie Mae"
+
+Return ONLY a JSON object with this structure:
+{
+  "verified": true/false,
+  "errors": [
+    {
+      "section": "securities_detail",
+      "claim": "the exact text that is wrong",
+      "source_value": "what the data actually says",
+      "correction": "what it should say"
+    }
+  ]
+}
+
+If everything checks out, return {"verified": true, "errors": []}.
+Be strict. If a number is wrong by more than $1M or 0.1%, flag it."""
+
+VERIFICATION_USER = """Verify this generated report against the source data.
+
+GENERATED REPORT:
+{report_json}
+
+SOURCE DATA — CURRENT PERIOD PORTFOLIO POSITIONS:
+{portfolio_data_json}
+
+SOURCE DATA — PRIOR PERIOD PORTFOLIO POSITIONS:
+{prior_portfolio_positions_json}
+
+SOURCE DATA — CURRENT PERIOD MONTHLY METRICS:
+{monthly_data_json}
+
+SOURCE DATA — PRIOR PERIOD MONTHLY METRICS:
+{prior_monthly_metrics_json}
+
+Check every number. Return the verification JSON."""
 
 SUMMARY_REPORT_USER = """Generate a {report_type} summary report for {company_name} ({ticker}) covering {period_label}.
 

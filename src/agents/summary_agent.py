@@ -124,6 +124,139 @@ async def generate_summary_report(
         "raw_response": response_text,
     }
 
+    # ── Verification pass ──────────────────────────────────────────
+    report, metadata = await _verify_and_correct(
+        report, metadata, data_context, client,
+        company_name, ticker, period_label, report_type,
+    )
+
+    return report, metadata
+
+
+async def _verify_and_correct(
+    report: SummaryReport,
+    metadata: dict,
+    data_context: dict,
+    client: anthropic.AsyncAnthropic,
+    company_name: str,
+    ticker: str,
+    period_label: str,
+    report_type: str,
+) -> tuple[SummaryReport, dict]:
+    """
+    Send the generated report + source data to Claude for fact-checking.
+    If errors are found, regenerate with corrections appended as guidance.
+    """
+    from src.agents.prompts.summary_templates import (
+        VERIFICATION_SYSTEM,
+        VERIFICATION_USER,
+        SUMMARY_REPORT_SYSTEM,
+        SUMMARY_REPORT_USER,
+    )
+
+    report_dict = report.model_dump()
+    verification_msg = VERIFICATION_USER.format(
+        report_json=json.dumps(report_dict, indent=2, default=str),
+        portfolio_data_json=json.dumps(data_context.get("portfolio_data", []), indent=2, default=str),
+        prior_portfolio_positions_json=json.dumps(data_context.get("prior_portfolio_positions", {}), indent=2, default=str),
+        monthly_data_json=json.dumps(data_context.get("monthly_data", []), indent=2, default=str),
+        prior_monthly_metrics_json=json.dumps(data_context.get("prior_monthly_metrics", []), indent=2, default=str),
+    )
+
+    logger.info("Running verification pass for %s %s", ticker, period_label)
+
+    try:
+        verify_response = await client.messages.create(
+            model=settings.summary_model,
+            max_tokens=4096,
+            system=VERIFICATION_SYSTEM,
+            messages=[{"role": "user", "content": verification_msg}],
+        )
+
+        verify_text = verify_response.content[0].text.strip()
+        if verify_text.startswith("```"):
+            verify_text = verify_text.split("\n", 1)[1]
+            if verify_text.endswith("```"):
+                verify_text = verify_text[:-3]
+            verify_text = verify_text.strip()
+
+        verification = json.loads(verify_text)
+        errors = verification.get("errors", [])
+        metadata["verification_tokens"] = {
+            "input": verify_response.usage.input_tokens,
+            "output": verify_response.usage.output_tokens,
+        }
+
+        if not errors:
+            logger.info("Verification passed — no errors found")
+            metadata["verified"] = True
+            return report, metadata
+
+        logger.warning("Verification found %d error(s), regenerating", len(errors))
+        metadata["verification_errors"] = errors
+
+        # Regenerate with corrections as guidance
+        corrections_text = "\n".join(
+            f"- CORRECTION: \"{e.get('claim', '')}\" is wrong. "
+            f"Source says: {e.get('source_value', '')}. "
+            f"Fix: {e.get('correction', '')}"
+            for e in errors
+        )
+
+        schema_json = json.dumps(SummaryReport.model_json_schema(), indent=2)
+        user_message = SUMMARY_REPORT_USER.format(
+            company_name=company_name,
+            ticker=ticker,
+            period_label=period_label,
+            report_type=report_type,
+            monthly_data_json=json.dumps(data_context.get("monthly_data", []), indent=2, default=str),
+            quarterly_data_json=json.dumps(data_context.get("quarterly_data", []), indent=2, default=str),
+            analyses_json=json.dumps(data_context.get("analyses", []), indent=2, default=str),
+            portfolio_data_json=json.dumps(data_context.get("portfolio_data", []), indent=2, default=str),
+            cpr_data_json=json.dumps(data_context.get("cpr_data", []), indent=2, default=str),
+            prior_monthly_metrics_json=json.dumps(data_context.get("prior_monthly_metrics", []), indent=2, default=str),
+            prior_portfolio_positions_json=json.dumps(data_context.get("prior_portfolio_positions", {}), indent=2, default=str),
+            prior_quarterly_metrics_json=json.dumps(data_context.get("prior_quarterly_metrics", []), indent=2, default=str),
+            universal_extractions_json=json.dumps(data_context.get("universal_extractions", []), indent=2, default=str),
+            prior_universal_extractions_json=json.dumps(data_context.get("prior_universal_extractions", []), indent=2, default=str),
+            schema_json=schema_json,
+        )
+        user_message += f"\n\nIMPORTANT — A prior draft had these errors. Fix them:\n{corrections_text}"
+
+        regen_text = ""
+        async with client.messages.stream(
+            model=settings.summary_model,
+            max_tokens=12288,
+            system=SUMMARY_REPORT_SYSTEM,
+            messages=[{"role": "user", "content": user_message}],
+        ) as stream:
+            async for text in stream.text_stream:
+                regen_text += text
+            regen_msg = await stream.get_final_message()
+
+        regen_text = regen_text.strip()
+        if regen_text.startswith("```"):
+            regen_text = regen_text.split("\n", 1)[1]
+            if regen_text.endswith("```"):
+                regen_text = regen_text[:-3]
+            regen_text = regen_text.strip()
+
+        regen_data = json.loads(regen_text)
+        report = SummaryReport.model_validate(regen_data)
+
+        metadata["regenerated"] = True
+        metadata["regen_tokens"] = {
+            "input": regen_msg.usage.input_tokens,
+            "output": regen_msg.usage.output_tokens,
+        }
+        metadata["raw_response"] = regen_text
+        logger.info("Regenerated report with %d corrections applied", len(errors))
+
+    except Exception as e:
+        logger.warning("Verification pass failed (non-fatal): %s", str(e)[:200])
+        metadata["verified"] = False
+        metadata["verification_error"] = str(e)[:200]
+
     return report, metadata
 
 
