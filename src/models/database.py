@@ -89,3 +89,11 @@ def log_poll(company_id: str, poll_type: str, poll_url: str, new_filings: int = 
         "new_filings_found": new_filings,
         "error_message": error,
     }).execute()
+
+
+def filter_new_filings(detected: list, company_id: str) -> list:
+    """Filter out filings already in the filings table by source_url."""
+    client = get_supabase_client()
+    existing = client.table("filings").select("source_url").eq("company_id", company_id).execute()
+    existing_urls = {r["source_url"] for r in existing.data}
+    return [f for f in detected if f.source_url not in existing_urls]

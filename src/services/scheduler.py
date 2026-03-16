@@ -25,13 +25,12 @@ async def poll_all_companies():
     3. Poll SEC EDGAR for new filings
     4. For any new filings found, trigger the download + extraction pipeline
     """
-    from src.config.companies import COMPANY_CONFIGS
     from src.config.company_registry import get_company_config
-    from src.models.database import get_active_companies, get_latest_filing, log_poll
-    from src.models.schemas import FilingType
+    from src.models.database import get_active_companies, get_latest_filing, log_poll, filter_new_filings
+    from src.models.schemas import FilingType, DetectedFiling
     from src.services.edgar import check_new_filings as check_edgar_filings
-    from src.services.scraper import DetectedFiling, scrape_company, filter_new_filings
-    from src.parsers.monthly_update import process_monthly_update
+    from src.services.universal_scraper import scrape_company_universal, filter_new_documents
+    from src.parsers.universal_document_processor import store_detected_document
 
     logger.info("Starting daily poll for all active companies...")
 
@@ -57,66 +56,51 @@ async def poll_all_companies():
         company_id = company["id"]
         company_name = company["name"]
 
-        # Get registry config for this company
         registry_config = get_company_config(ticker)
+        if not registry_config:
+            logger.warning("No config for %s — skipping", ticker)
+            continue
 
         try:
             # ----------------------------------------------------------
-            # ARMOUR: Use existing scraper pipeline
-            # Other companies: Use universal scraper
+            # Phase 1: Universal scraper (all companies, detect only)
             # ----------------------------------------------------------
-            if ticker == "ARR":
-                # Existing ARMOUR pipeline (unchanged)
-                detected = await scrape_company(company)
-            elif registry_config:
-                # Universal scraper for new companies — detect only, don't process
-                from src.services.universal_scraper import (
-                    scrape_company_universal,
-                    filter_new_documents,
-                )
-                from src.parsers.universal_document_processor import store_detected_document
+            universal_docs = await scrape_company_universal(registry_config, ticker)
+            new_docs = await filter_new_documents(universal_docs, company_id)
+            total_new += len(new_docs)
+            for doc in new_docs:
+                filing_details.append({
+                    "ticker": ticker,
+                    "type": doc.document_type,
+                    "period": doc.period_label or "",
+                    "url": doc.source_url,
+                })
 
-                universal_docs = await scrape_company_universal(registry_config, ticker)
-                new_docs = await filter_new_documents(universal_docs, company_id)
-                total_new += len(new_docs)
-                for doc in new_docs:
-                    filing_details.append({
-                        "ticker": ticker,
-                        "type": doc.document_type,
-                        "period": doc.period_label or "",
-                        "url": doc.source_url,
-                    })
+            log_poll(company_id, "universal_scrape", ticker, new_filings=len(new_docs))
 
-                log_poll(company_id, "universal_scrape", ticker, new_filings=len(new_docs))
-
-                # Store as detected — user will approve processing from Review page
-                for doc in new_docs:
-                    try:
-                        store_detected_document(
-                            company_id=company_id,
-                            ticker=ticker,
-                            source_url=doc.source_url,
-                            document_type=doc.document_type,
-                            document_date=doc.document_date,
-                            title=doc.title,
-                            period_label=doc.period_label or "",
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Failed to store detected %s %s %s: %s",
-                            ticker, doc.document_type, doc.period_label, e,
-                        )
-
-                # Skip the ARMOUR-specific scraper/EDGAR/filter logic below
-                detected = []
-            else:
-                logger.warning("No config for %s — skipping", ticker)
-                continue
+            # Store as detected — user approves processing from Review page
+            for doc in new_docs:
+                try:
+                    store_detected_document(
+                        company_id=company_id,
+                        ticker=ticker,
+                        source_url=doc.source_url,
+                        document_type=doc.document_type,
+                        document_date=doc.document_date,
+                        title=doc.title,
+                        period_label=doc.period_label or "",
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to store detected %s %s %s: %s",
+                        ticker, doc.document_type, doc.period_label, e,
+                    )
 
             # ----------------------------------------------------------
             # Phase 2: Poll SEC EDGAR (all companies)
             # ----------------------------------------------------------
-            cik = registry_config.cik if registry_config else COMPANY_CONFIGS.get(ticker, {}).get("cik")
+            detected = []
+            cik = registry_config.cik
 
             if cik:
                 try:
@@ -175,42 +159,27 @@ async def poll_all_companies():
                         "url": filing.source_url,
                     })
 
-                config = COMPANY_CONFIGS.get(ticker, {})
-                monthly_url = config.get("monthly_updates_url", "")
-                log_poll(company_id, "ir_scrape", monthly_url, new_filings=len(new_filings))
+                log_poll(company_id, "edgar", f"CIK:{cik}", new_filings=len(new_filings))
 
                 # ----------------------------------------------------------
-                # Phase 4: Store detected filings (detect-only, no processing)
-                # ARR monthly_update is the exception — still auto-processed
+                # Phase 4: Store detected EDGAR filings (detect-only)
                 # ----------------------------------------------------------
-                from src.parsers.universal_document_processor import store_detected_document as store_detected_edgar
+                _DOC_TYPE_MAP = {
+                    "earnings_release": "quarterly_earnings",
+                    "quarterly_10q": "quarterly_10q",
+                    "annual_10k": "annual_10k",
+                    "monthly_update": "monthly_update",
+                }
 
                 for filing in new_filings:
                     filing_type_val = filing.filing_type.value
                     try:
-                        if filing_type_val == "monthly_update" and ticker == "ARR":
-                            # ARR monthly updates still auto-process (existing pipeline)
-                            await process_monthly_update(
-                                company_id=company_id,
-                                company_name=company_name,
-                                ticker=ticker,
-                                source_url=filing.source_url,
-                                filing_date=filing.filing_date,
-                                period_label=filing.period_label,
-                            )
-                        elif filing_type_val in ("earnings_release", "quarterly_10q", "annual_10k", "monthly_update"):
-                            # Store as detected — user approves from Review page
-                            doc_type_map = {
-                                "earnings_release": "quarterly_earnings",
-                                "quarterly_10q": "quarterly_10q",
-                                "annual_10k": "annual_10k",
-                                "monthly_update": "monthly_update",
-                            }
-                            store_detected_edgar(
+                        if filing_type_val in _DOC_TYPE_MAP:
+                            store_detected_document(
                                 company_id=company_id,
                                 ticker=ticker,
                                 source_url=filing.source_url,
-                                document_type=doc_type_map.get(filing_type_val, filing_type_val),
+                                document_type=_DOC_TYPE_MAP[filing_type_val],
                                 document_date=filing.filing_date,
                                 title=f"{ticker} {filing.period_label}",
                                 period_label=filing.period_label or "",

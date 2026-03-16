@@ -15,6 +15,7 @@ from datetime import date
 import httpx
 
 from src.config.company_registry import CompanyConfig
+from src.config.settings import settings
 from src.services.supabase_client import get_supabase_client
 
 logger = logging.getLogger("mreit-monitor.universal_doc_processor")
@@ -81,7 +82,7 @@ async def process_document(
             follow_redirects=True,
             timeout=60.0,
             headers={
-                "User-Agent": "mREIT-Monitor/1.0 contact@mreitmonitor.com",
+                "User-Agent": settings.edgar_user_agent,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Encoding": "gzip, deflate",
             },

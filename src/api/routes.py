@@ -68,11 +68,11 @@ async def health_check():
 
 @router.post("/trigger/poll/{ticker}", response_model=TriggerResponse, dependencies=[Depends(require_api_key)])
 async def trigger_poll(ticker: str):
-    """Manually trigger a poll for a specific company. Works for all tickers."""
+    """Manually trigger a poll for a specific company. Stores detected filings for review."""
     from src.config.company_registry import get_company_config
     from src.models.database import get_company_by_ticker
-    from src.services.scraper import scrape_company, filter_new_filings
-    from src.parsers.monthly_update import process_monthly_update
+    from src.services.universal_scraper import scrape_company_universal, filter_new_documents
+    from src.parsers.universal_document_processor import store_detected_document
 
     logger.info("Manual poll triggered for %s", ticker.upper())
 
@@ -81,68 +81,31 @@ async def trigger_poll(ticker: str):
         raise HTTPException(status_code=404, detail=f"Company {ticker.upper()} not found")
 
     registry_config = get_company_config(ticker)
-
-    # ARMOUR uses existing scraper; other companies use universal scraper
-    if ticker.upper() == "ARR":
-        detected = await scrape_company(company)
-        new_filings = await filter_new_filings(detected, company["id"])
-
-        processed = 0
-        for filing in new_filings:
-            if filing.filing_type.value == "monthly_update":
-                try:
-                    await process_monthly_update(
-                        company_id=company["id"],
-                        company_name=company["name"],
-                        ticker=company["ticker"],
-                        source_url=filing.source_url,
-                        filing_date=filing.filing_date,
-                        period_label=filing.period_label,
-                    )
-                    processed += 1
-                except Exception as e:
-                    logger.error("Failed to process %s: %s", filing.period_label, e)
-
-        return TriggerResponse(
-            status="ok",
-            message=f"Poll complete. {len(detected)} detected, {len(new_filings)} new, {processed} processed.",
-            filings_found=len(new_filings),
-        )
-
-    elif registry_config:
-        from src.services.universal_scraper import scrape_company_universal, filter_new_documents
-        from src.parsers.universal_document_processor import process_document
-
-        detected = await scrape_company_universal(registry_config, ticker.upper())
-        new_docs = await filter_new_documents(detected, company["id"])
-
-        processed = 0
-        for doc in new_docs:
-            try:
-                success = await process_document(
-                    company_id=company["id"],
-                    company_name=company["name"],
-                    ticker=company["ticker"],
-                    company_config=registry_config,
-                    source_url=doc.source_url,
-                    document_type=doc.document_type,
-                    document_date=doc.document_date,
-                    period_label=doc.period_label,
-                    title=doc.title,
-                )
-                if success:
-                    processed += 1
-            except Exception as e:
-                logger.error("Failed to process %s: %s", doc.period_label, e)
-
-        return TriggerResponse(
-            status="ok",
-            message=f"Poll complete. {len(detected)} detected, {len(new_docs)} new, {processed} processed.",
-            filings_found=len(new_docs),
-        )
-
-    else:
+    if not registry_config:
         raise HTTPException(status_code=400, detail=f"No configuration for {ticker.upper()}")
+
+    detected = await scrape_company_universal(registry_config, ticker.upper())
+    new_docs = await filter_new_documents(detected, company["id"])
+
+    for doc in new_docs:
+        try:
+            store_detected_document(
+                company_id=company["id"],
+                ticker=company["ticker"],
+                source_url=doc.source_url,
+                document_type=doc.document_type,
+                document_date=doc.document_date,
+                title=doc.title,
+                period_label=doc.period_label or "",
+            )
+        except Exception as e:
+            logger.error("Failed to store detected %s: %s", doc.period_label, e)
+
+    return TriggerResponse(
+        status="ok",
+        message=f"Poll complete. {len(detected)} detected, {len(new_docs)} new (stored as pending).",
+        filings_found=len(new_docs),
+    )
 
 
 class ExtractRequest(BaseModel):
@@ -153,10 +116,10 @@ class ExtractRequest(BaseModel):
 
 @router.post("/trigger/process", dependencies=[Depends(require_api_key)])
 async def trigger_process(source_url: str, ticker: str = "ARR", filing_type: str = "monthly_update"):
-    """Manually process a specific filing by URL."""
+    """Manually process a specific filing by URL via the universal pipeline."""
     from src.config.company_registry import get_company_config
     from src.models.database import get_company_by_ticker
-    from src.parsers.monthly_update import process_monthly_update
+    from src.parsers.universal_document_processor import process_document
 
     logger.info("Manual process triggered for %s (%s)", source_url, ticker.upper())
 
@@ -164,42 +127,25 @@ async def trigger_process(source_url: str, ticker: str = "ARR", filing_type: str
     if not company:
         raise HTTPException(status_code=404, detail=f"Company {ticker.upper()} not found")
 
-    if filing_type == "monthly_update" and ticker.upper() == "ARR":
-        success = await process_monthly_update(
-            company_id=company["id"],
-            company_name=company["name"],
-            ticker=company["ticker"],
-            source_url=source_url,
-            filing_date=datetime.utcnow().date(),
-            period_label="Manual Processing",
-        )
-        return TriggerResponse(
-            status="ok" if success else "error",
-            message=f"Processing {'completed' if success else 'failed'} for {source_url}",
-            filings_found=1,
-        )
-    else:
-        # Use universal pipeline
-        registry_config = get_company_config(ticker)
-        if not registry_config:
-            raise HTTPException(status_code=400, detail=f"No config for {ticker.upper()}")
+    registry_config = get_company_config(ticker)
+    if not registry_config:
+        raise HTTPException(status_code=400, detail=f"No config for {ticker.upper()}")
 
-        from src.parsers.universal_document_processor import process_document
-        success = await process_document(
-            company_id=company["id"],
-            company_name=company["name"],
-            ticker=company["ticker"],
-            company_config=registry_config,
-            source_url=source_url,
-            document_type=filing_type,
-            document_date=datetime.utcnow().date(),
-            period_label="Manual Processing",
-        )
-        return TriggerResponse(
-            status="ok" if success else "error",
-            message=f"Processing {'completed' if success else 'failed'} for {source_url}",
-            filings_found=1,
-        )
+    success = await process_document(
+        company_id=company["id"],
+        company_name=company["name"],
+        ticker=company["ticker"],
+        company_config=registry_config,
+        source_url=source_url,
+        document_type=filing_type,
+        document_date=datetime.utcnow().date(),
+        period_label="Manual Processing",
+    )
+    return TriggerResponse(
+        status="ok" if success else "error",
+        message=f"Processing {'completed' if success else 'failed'} for {source_url}",
+        filings_found=1,
+    )
 
 
 @router.post("/trigger/extract", dependencies=[Depends(require_api_key)])

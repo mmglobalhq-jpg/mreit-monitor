@@ -4,6 +4,7 @@ These schemas are used both for Claude API extraction validation
 and for Supabase insert operations.
 """
 
+from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from typing import Optional
@@ -28,6 +29,16 @@ class FilingType(str, Enum):
     MONTHLY_BOOK_VALUE = "monthly_book_value"
     PRESS_RELEASE = "press_release"
     OTHER = "other"
+
+
+@dataclass
+class DetectedFiling:
+    """A filing detected by scraping or EDGAR but not yet downloaded."""
+    source_url: str
+    filing_type: FilingType
+    filing_date: date
+    period_label: str
+    source_page: str
 
 
 class FilingStatus(str, Enum):
