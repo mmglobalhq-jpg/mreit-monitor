@@ -69,12 +69,12 @@ async def poll_all_companies():
                 # Existing ARMOUR pipeline (unchanged)
                 detected = await scrape_company(company)
             elif registry_config:
-                # Universal scraper for new companies
+                # Universal scraper for new companies — detect only, don't process
                 from src.services.universal_scraper import (
                     scrape_company_universal,
                     filter_new_documents,
                 )
-                from src.parsers.universal_document_processor import process_document
+                from src.parsers.universal_document_processor import store_detected_document
 
                 universal_docs = await scrape_company_universal(registry_config, ticker)
                 new_docs = await filter_new_documents(universal_docs, company_id)
@@ -89,22 +89,21 @@ async def poll_all_companies():
 
                 log_poll(company_id, "universal_scrape", ticker, new_filings=len(new_docs))
 
+                # Store as detected — user will approve processing from Review page
                 for doc in new_docs:
                     try:
-                        await process_document(
+                        store_detected_document(
                             company_id=company_id,
-                            company_name=company_name,
                             ticker=ticker,
-                            company_config=registry_config,
                             source_url=doc.source_url,
                             document_type=doc.document_type,
                             document_date=doc.document_date,
-                            period_label=doc.period_label,
                             title=doc.title,
+                            period_label=doc.period_label or "",
                         )
                     except Exception as e:
                         logger.error(
-                            "Failed to process %s %s %s: %s",
+                            "Failed to store detected %s %s %s: %s",
                             ticker, doc.document_type, doc.period_label, e,
                         )
 
@@ -181,12 +180,16 @@ async def poll_all_companies():
                 log_poll(company_id, "ir_scrape", monthly_url, new_filings=len(new_filings))
 
                 # ----------------------------------------------------------
-                # Phase 4: Process each new filing
+                # Phase 4: Store detected filings (detect-only, no processing)
+                # ARR monthly_update is the exception — still auto-processed
                 # ----------------------------------------------------------
+                from src.parsers.universal_document_processor import store_detected_document as store_detected_edgar
+
                 for filing in new_filings:
                     filing_type_val = filing.filing_type.value
                     try:
-                        if filing_type_val == "monthly_update":
+                        if filing_type_val == "monthly_update" and ticker == "ARR":
+                            # ARR monthly updates still auto-process (existing pipeline)
                             await process_monthly_update(
                                 company_id=company_id,
                                 company_name=company_name,
@@ -195,43 +198,23 @@ async def poll_all_companies():
                                 filing_date=filing.filing_date,
                                 period_label=filing.period_label,
                             )
-                        elif filing_type_val == "earnings_release":
-                            # Process via universal pipeline for non-ARMOUR companies
-                            if ticker != "ARR" and registry_config:
-                                from src.parsers.universal_document_processor import process_document
-                                await process_document(
-                                    company_id=company_id,
-                                    company_name=company_name,
-                                    ticker=ticker,
-                                    company_config=registry_config,
-                                    source_url=filing.source_url,
-                                    document_type="quarterly_earnings",
-                                    document_date=filing.filing_date,
-                                    period_label=filing.period_label,
-                                )
-                            else:
-                                logger.info(
-                                    "Detected earnings release for %s %s — skipping (use existing pipeline)",
-                                    ticker, filing.period_label,
-                                )
-                        elif filing_type_val in ("quarterly_10q", "annual_10k"):
-                            if ticker != "ARR" and registry_config:
-                                from src.parsers.universal_document_processor import process_document
-                                await process_document(
-                                    company_id=company_id,
-                                    company_name=company_name,
-                                    ticker=ticker,
-                                    company_config=registry_config,
-                                    source_url=filing.source_url,
-                                    document_type=filing_type_val,
-                                    document_date=filing.filing_date,
-                                    period_label=filing.period_label,
-                                )
-                            else:
-                                logger.info(
-                                    "Detected %s for %s %s — processing not yet implemented",
-                                    filing_type_val, ticker, filing.period_label,
-                                )
+                        elif filing_type_val in ("earnings_release", "quarterly_10q", "annual_10k", "monthly_update"):
+                            # Store as detected — user approves from Review page
+                            doc_type_map = {
+                                "earnings_release": "quarterly_earnings",
+                                "quarterly_10q": "quarterly_10q",
+                                "annual_10k": "annual_10k",
+                                "monthly_update": "monthly_update",
+                            }
+                            store_detected_edgar(
+                                company_id=company_id,
+                                ticker=ticker,
+                                source_url=filing.source_url,
+                                document_type=doc_type_map.get(filing_type_val, filing_type_val),
+                                document_date=filing.filing_date,
+                                title=f"{ticker} {filing.period_label}",
+                                period_label=filing.period_label or "",
+                            )
                         else:
                             logger.info(
                                 "Skipping filing type %s for %s (%s)",
@@ -239,7 +222,7 @@ async def poll_all_companies():
                             )
                     except Exception as e:
                         logger.error(
-                            "Failed to process %s %s %s: %s",
+                            "Failed to store detected %s %s %s: %s",
                             ticker, filing_type_val, filing.period_label, e,
                         )
 

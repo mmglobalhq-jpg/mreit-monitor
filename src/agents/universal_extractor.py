@@ -1,15 +1,15 @@
 """
-Universal extractor — sends any document to Claude API and returns a UniversalExtraction.
+Universal extractor — sends any document to an AI model and returns a UniversalExtraction.
 
-Works for all 6 companies and all document types. Selects the correct prompt
-based on document_type and injects company context.
+Works for all 7 companies and all document types. Selects the correct prompt
+based on document_type and injects company context. Supports Claude, OpenAI,
+and Gemini models via the model_router.
 """
 
 import base64
 import json
 import logging
 
-import anthropic
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config.company_registry import CompanyConfig
@@ -19,44 +19,18 @@ from src.models.universal_schemas import UniversalExtraction
 logger = logging.getLogger("mreit-monitor.universal_extractor")
 
 
-def _get_client() -> anthropic.AsyncAnthropic:
-    return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=30),
-    reraise=True,
-)
-async def extract_document(
+def _build_extraction_request(
     content: str | bytes,
     document_type: str,
     company_config: CompanyConfig,
-    source_url: str = "",
     is_pdf: bool = False,
-) -> tuple[UniversalExtraction, dict]:
-    """
-    Extract structured data from any document into UniversalExtraction.
-
-    Args:
-        content: Document text (str) or PDF bytes
-        document_type: e.g. 'quarterly_earnings', 'financial_supplement'
-        company_config: CompanyConfig for the company
-        source_url: URL the document came from
-        is_pdf: True if content is PDF bytes
-
-    Returns:
-        Tuple of (UniversalExtraction model, metadata dict)
-    """
+) -> tuple[str, str | list]:
+    """Build system prompt and user content for extraction. Provider-agnostic."""
     from src.agents.prompts.extraction_prompts import get_extraction_prompts, _PREAMBLE
 
-    client = _get_client()
     schema_json = json.dumps(UniversalExtraction.model_json_schema(), indent=2)
-
-    # Get prompts for this document type
     system_template, user_template = get_extraction_prompts(document_type)
 
-    # Build preamble with company context
     preamble = _PREAMBLE.format(
         document_type=document_type,
         company_name=company_config.name,
@@ -67,7 +41,6 @@ async def extract_document(
 
     system_prompt = system_template.format(preamble=preamble)
 
-    # Build user message
     if is_pdf and isinstance(content, bytes):
         pdf_b64 = base64.standard_b64encode(content).decode("utf-8")
         user_content = [
@@ -92,7 +65,6 @@ async def extract_document(
         ]
     else:
         text_content = content if isinstance(content, str) else content.decode("utf-8", errors="replace")
-        # Truncate very long documents to fit context
         if len(text_content) > 200_000:
             text_content = text_content[:200_000] + "\n\n[TRUNCATED — document exceeds 200k chars]"
 
@@ -104,24 +76,17 @@ async def extract_document(
             schema_json=schema_json,
         )
 
-    logger.info(
-        "Extracting %s for %s via Claude %s...",
-        document_type, company_config.name, settings.extraction_model,
-    )
+    return system_prompt, user_content
 
-    message = await client.messages.create(
-        model=settings.extraction_model,
-        max_tokens=8192,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_content}],
-    )
 
-    # Parse response
-    response_text = ""
-    for block in message.content:
-        if block.type == "text":
-            response_text += block.text
+def _parse_extraction_response(response_text: str, defaults: dict | None = None) -> UniversalExtraction:
+    """Parse raw model response text into a UniversalExtraction.
 
+    Args:
+        response_text: Raw JSON string from the model
+        defaults: Optional dict of fallback values for required fields that
+                  models may leave null (source_url, document_date, etc.)
+    """
     response_text = response_text.strip()
     if response_text.startswith("```"):
         response_text = response_text.split("\n", 1)[1]
@@ -129,9 +94,73 @@ async def extract_document(
             response_text = response_text[:-3]
         response_text = response_text.strip()
 
+    data = json.loads(response_text)
+
+    # Patch required fields that non-Claude models often leave null
+    if defaults:
+        for key, val in defaults.items():
+            if data.get(key) is None:
+                data[key] = val
+    # Ensure required fields have sane defaults even without explicit defaults
+    if data.get("source_url") is None:
+        data["source_url"] = ""
+    if data.get("document_date") is None:
+        from datetime import date as _d
+        data["document_date"] = _d.today().isoformat()
+    if data.get("additional_data") is None:
+        data["additional_data"] = {}
+
+    return UniversalExtraction.model_validate(data)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=30),
+    reraise=True,
+)
+async def extract_document(
+    content: str | bytes,
+    document_type: str,
+    company_config: CompanyConfig,
+    source_url: str = "",
+    is_pdf: bool = False,
+    model_override: str | None = None,
+) -> tuple[UniversalExtraction, dict]:
+    """
+    Extract structured data from any document into UniversalExtraction.
+
+    Args:
+        content: Document text (str) or PDF bytes
+        document_type: e.g. 'quarterly_earnings', 'financial_supplement'
+        company_config: CompanyConfig for the company
+        source_url: URL the document came from
+        is_pdf: True if content is PDF bytes
+        model_override: Use a specific model instead of settings.extraction_model
+
+    Returns:
+        Tuple of (UniversalExtraction model, metadata dict)
+    """
+    from src.agents.model_router import extract_with_model
+
+    model = model_override or settings.extraction_model
+    system_prompt, user_content = _build_extraction_request(
+        content, document_type, company_config, is_pdf
+    )
+
+    logger.info(
+        "Extracting %s for %s via %s...",
+        document_type, company_config.name, model,
+    )
+
+    response_text, metadata = await extract_with_model(
+        model=model,
+        system_prompt=system_prompt,
+        user_content=user_content,
+        max_tokens=8192,
+    )
+
     try:
-        data = json.loads(response_text)
-        extraction = UniversalExtraction.model_validate(data)
+        extraction = _parse_extraction_response(response_text)
     except (json.JSONDecodeError, Exception) as e:
         logger.error("Failed to parse universal extraction: %s", str(e)[:200])
         logger.debug("Raw response: %s", response_text[:500])
@@ -145,12 +174,7 @@ async def extract_document(
         len(extraction.fields_extracted),
     )
 
-    metadata = {
-        "model": settings.extraction_model,
-        "input_tokens": message.usage.input_tokens,
-        "output_tokens": message.usage.output_tokens,
-        "raw_response": response_text,
-    }
+    metadata["raw_response"] = response_text
 
     return extraction, metadata
 

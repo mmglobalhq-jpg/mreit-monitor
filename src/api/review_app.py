@@ -164,6 +164,15 @@ LIST_PAGE_TEMPLATE = """<!DOCTYPE html>
     select, input {{ padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; }}
     select:disabled {{ background: #eee; color: #999; }}
     .no-data {{ font-size: 12px; color: #999; margin-top: 4px; }}
+    .pending-section {{ background: #fff8e1; padding: 20px; border-radius: 8px; margin: 24px 0; border: 1px solid #ffe082; }}
+    .pending-section h2 {{ font-size: 16px; margin-top: 0; color: #e65100; }}
+    .pending-card {{ display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: white; border-radius: 6px; margin: 8px 0; border: 1px solid #eee; }}
+    .pending-card-info {{ flex: 1; }}
+    .pending-card-ticker {{ font-weight: 600; font-size: 15px; }}
+    .pending-card-docs {{ font-size: 13px; color: #666; margin-top: 4px; }}
+    .badge-detected {{ background: #fff3e0; color: #e65100; }}
+    .btn-process {{ background: #e65100; color: white; }}
+    .btn-process:hover {{ background: #bf360c; text-decoration: none; }}
 </style>
 </head>
 <body>
@@ -190,6 +199,8 @@ LIST_PAGE_TEMPLATE = """<!DOCTYPE html>
         </form>
         <div id="noDataMsg" class="no-data" style="display:none;">No data available for this selection.</div>
     </div>
+
+    {pending_section}
 
     <h2 style="font-size: 18px;">Existing Reports</h2>
     <table>
@@ -404,6 +415,48 @@ async def list_reports():
     if not result.data:
         no_reports_msg = '<p style="color: #999; text-align: center; padding: 40px;">No summary reports generated yet. Use the form above to create one.</p>'
 
+    # Build pending filings section
+    pending_docs = (
+        client.table("company_documents")
+        .select("id, company_id, document_type, source_url, title, document_date, created_at")
+        .eq("status", "detected")
+        .order("created_at", desc=True)
+        .execute()
+    ).data
+
+    pending_section = ""
+    if pending_docs:
+        # Group by company
+        by_company = {}
+        for doc in pending_docs:
+            ticker = co_map.get(doc["company_id"], "?")
+            if ticker not in by_company:
+                by_company[ticker] = []
+            by_company[ticker].append(doc)
+
+        cards_html = ""
+        for ticker in sorted(by_company.keys()):
+            docs = by_company[ticker]
+            doc_list = ", ".join(d.get("title") or d.get("document_type", "?") for d in docs)
+            cards_html += f"""
+            <div class="pending-card">
+                <div class="pending-card-info">
+                    <span class="pending-card-ticker">{ticker}</span>
+                    <span class="badge badge-detected">{len(docs)} pending</span>
+                    <div class="pending-card-docs">{doc_list}</div>
+                </div>
+                <form action="/review/process/{ticker}" method="post" style="display: inline;">
+                    <button type="submit" class="btn btn-process btn-sm">Update Filings</button>
+                </form>
+            </div>"""
+
+        pending_section = f"""
+        <div class="pending-section">
+            <h2>Pending Filings</h2>
+            <p style="font-size: 13px; color: #666; margin-top: 0;">New filings detected. Click "Update Filings" to download and extract.</p>
+            {cards_html}
+        </div>"""
+
     # Build available periods for the form
     available = _get_available_periods()
     available_json = json.dumps(available)
@@ -419,6 +472,7 @@ async def list_reports():
         no_reports_msg=no_reports_msg,
         available_json=available_json,
         ticker_options=ticker_options,
+        pending_section=pending_section,
     )
     return HTMLResponse(content=html)
 
@@ -426,6 +480,10 @@ async def list_reports():
 @review_router.get("/{report_id}", response_class=HTMLResponse)
 async def view_report(report_id: str):
     """View a single summary report rendered as HTML."""
+    # Route ab-test to its handler (defined later) to avoid path capture
+    if report_id == "ab-test":
+        return await ab_test_page()
+
     from src.services.supabase_client import get_supabase_client
 
     client = get_supabase_client()
@@ -577,6 +635,74 @@ async def send_report_email(report_id: str):
     return RedirectResponse(url=f"/review/{report_id}", status_code=303)
 
 
+@review_router.post("/process/{ticker}")
+async def process_pending_filings(ticker: str):
+    """Process all detected (pending) filings for a company."""
+    from src.config.company_registry import get_company_config
+    from src.models.database import get_company_by_ticker
+    from src.parsers.universal_document_processor import process_document
+    from src.services.supabase_client import get_supabase_client
+
+    company = get_company_by_ticker(ticker.upper())
+    if not company:
+        raise HTTPException(status_code=404, detail=f"Company {ticker.upper()} not found")
+
+    config = get_company_config(ticker.upper())
+    if not config:
+        raise HTTPException(status_code=400, detail=f"No registry config for {ticker.upper()}")
+
+    client = get_supabase_client()
+    pending = (
+        client.table("company_documents")
+        .select("*")
+        .eq("company_id", company["id"])
+        .eq("status", "detected")
+        .execute()
+    ).data
+
+    if not pending:
+        logger.info("No pending filings for %s", ticker.upper())
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/review/", status_code=303)
+
+    logger.info("Processing %d pending filings for %s", len(pending), ticker.upper())
+
+    from datetime import date as date_cls
+
+    for doc in pending:
+        try:
+            doc_date = None
+            if doc.get("document_date"):
+                raw = doc["document_date"]
+                if isinstance(raw, str):
+                    doc_date = date_cls.fromisoformat(raw[:10])
+                else:
+                    doc_date = raw
+            else:
+                doc_date = date_cls.today()
+
+            await process_document(
+                company_id=company["id"],
+                company_name=company["name"],
+                ticker=ticker.upper(),
+                company_config=config,
+                source_url=doc["source_url"],
+                document_type=doc["document_type"],
+                document_date=doc_date,
+                period_label=doc.get("title") or doc.get("document_type", ""),
+                title=doc.get("title", ""),
+                skip_email=True,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to process %s %s: %s",
+                ticker.upper(), doc.get("title", doc["source_url"][:60]), e,
+            )
+
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/review/", status_code=303)
+
+
 @review_router.post("/generate")
 async def generate_from_form(
     ticker: str = Form(),
@@ -624,3 +750,306 @@ async def generate_from_form(
 
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url="/review/", status_code=303)
+
+
+# ============================================================================
+# A/B Test Page — Compare extraction models
+# ============================================================================
+
+AB_TEST_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head>
+<title>mREIT Monitor — A/B Model Test</title>
+<style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #1a1a1a; line-height: 1.6; max-width: 1100px; margin: 0 auto; padding: 20px; }}
+    h1 {{ font-size: 24px; font-weight: 600; }}
+    .subtitle {{ color: #666; font-size: 14px; margin-bottom: 24px; }}
+    .nav {{ margin-bottom: 20px; }}
+    .nav a {{ color: #0066cc; text-decoration: none; font-size: 14px; }}
+    .form-section {{ background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 24px 0; }}
+    .form-section h2 {{ font-size: 16px; margin-top: 0; }}
+    select, input {{ padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; }}
+    .btn {{ display: inline-block; padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; text-decoration: none; }}
+    .btn-primary {{ background: #0066cc; color: white; }}
+    .btn-primary:hover {{ background: #0052a3; }}
+    .checkbox-group {{ display: flex; gap: 16px; flex-wrap: wrap; margin: 8px 0; }}
+    .checkbox-group label {{ font-size: 14px; display: flex; align-items: center; gap: 4px; }}
+    .results {{ margin-top: 24px; }}
+    .results-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }}
+    .result-card {{ background: white; border: 1px solid #ddd; border-radius: 8px; padding: 16px; }}
+    .result-card h3 {{ font-size: 15px; margin-top: 0; }}
+    .result-card .meta {{ font-size: 12px; color: #888; margin-bottom: 12px; }}
+    .metric-row {{ display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; border-bottom: 1px solid #f0f0f0; }}
+    .metric-label {{ color: #666; }}
+    .metric-value {{ font-weight: 500; }}
+    .match {{ color: #2e7d32; }}
+    .mismatch {{ color: #c62828; font-weight: 600; }}
+    .cost {{ font-size: 13px; font-weight: 600; margin-top: 8px; }}
+    .cost-savings {{ color: #2e7d32; }}
+</style>
+</head>
+<body>
+    <div class="nav"><a href="/review/">&larr; Back to reports</a></div>
+    <h1>A/B Model Comparison</h1>
+    <p class="subtitle">Compare extraction accuracy and cost across different AI models</p>
+
+    <div class="form-section">
+        <h2>Select Document & Models</h2>
+        <form action="/review/ab-test" method="post" style="display: flex; flex-direction: column; gap: 12px;">
+            <div>
+                <label style="font-size: 12px; color: #666;">Document (already processed)</label><br>
+                <select name="document_id" style="min-width: 400px;">
+                    {document_options}
+                </select>
+            </div>
+            <div>
+                <label style="font-size: 12px; color: #666;">Models to compare</label>
+                <div class="checkbox-group">
+                    <label><input type="checkbox" name="models" value="claude-sonnet-4-20250514" checked> Claude Sonnet 4</label>
+                    <label><input type="checkbox" name="models" value="gpt-4.1-mini"> GPT-4.1 Mini</label>
+                    <label><input type="checkbox" name="models" value="gpt-4o-mini"> GPT-4o Mini</label>
+                    <label><input type="checkbox" name="models" value="gemini-2.5-flash"> Gemini 2.5 Flash</label>
+                    <label><input type="checkbox" name="models" value="gemini-2.0-flash"> Gemini 2.0 Flash</label>
+                </div>
+            </div>
+            <div>
+                <button type="submit" class="btn btn-primary" id="runBtn" onclick="this.textContent='Running... (30-60s per model)'; this.disabled=true; this.form.submit();">Run Comparison</button>
+            </div>
+        </form>
+    </div>
+
+    {results_html}
+</body>
+</html>"""
+
+
+@review_router.get("/ab-test", response_class=HTMLResponse)
+async def ab_test_page():
+    """A/B test page for comparing extraction models."""
+    from src.services.supabase_client import get_supabase_client
+
+    client = get_supabase_client()
+    companies = client.table("companies").select("id, ticker").execute().data
+    co_map = {co["id"]: co["ticker"] for co in companies}
+
+    docs = (
+        client.table("company_documents")
+        .select("id, company_id, document_type, title, document_date, source_url")
+        .eq("status", "completed")
+        .order("document_date", desc=True)
+        .limit(50)
+        .execute()
+    ).data
+
+    document_options = ""
+    for doc in docs:
+        ticker = co_map.get(doc["company_id"], "?")
+        title = doc.get("title") or doc.get("document_type", "?")
+        date_str = (doc.get("document_date") or "")[:10]
+        document_options += f'<option value="{doc["id"]}">{ticker} — {title} ({date_str})</option>\n'
+
+    html = AB_TEST_TEMPLATE.format(
+        document_options=document_options,
+        results_html="",
+    )
+    return HTMLResponse(content=html)
+
+
+@review_router.post("/ab-test", response_class=HTMLResponse)
+async def run_ab_test(
+    document_id: str = Form(),
+    models: list[str] = Form(),
+):
+    """Run extraction comparison across selected models."""
+    from src.config.company_registry import get_company_config
+    from src.services.supabase_client import get_supabase_client
+    from src.agents.universal_extractor import _build_extraction_request
+    from src.agents.model_router import extract_with_model
+    from src.models.universal_schemas import UniversalExtraction
+    import httpx
+
+    client = get_supabase_client()
+
+    doc = client.table("company_documents").select("*").eq("id", document_id).limit(1).execute().data
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    doc = doc[0]
+
+    company = client.table("companies").select("*").eq("id", doc["company_id"]).limit(1).execute().data
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    company = company[0]
+    ticker = company["ticker"]
+
+    config = get_company_config(ticker)
+    if not config:
+        raise HTTPException(status_code=400, detail=f"No config for {ticker}")
+
+    companies_list = client.table("companies").select("id, ticker").execute().data
+    co_map = {co["id"]: co["ticker"] for co in companies_list}
+
+    # Get document content
+    content = doc.get("raw_content", "")
+    is_pdf = False
+    if not content:
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=60.0,
+            headers={"User-Agent": "mREIT-Monitor/1.0 test@example.com"},
+        ) as http_client:
+            resp = await http_client.get(doc["source_url"])
+            resp.raise_for_status()
+            if "pdf" in resp.headers.get("content-type", "").lower():
+                content = resp.content
+                is_pdf = True
+            else:
+                content = resp.text
+
+    system_prompt, user_content = _build_extraction_request(
+        content, doc["document_type"], config, is_pdf
+    )
+
+    # Get baseline extraction for comparison
+    baseline_ext = (
+        client.table("universal_extractions")
+        .select("*")
+        .eq("document_id", document_id)
+        .limit(1)
+        .execute()
+    ).data
+    baseline = baseline_ext[0] if baseline_ext else None
+
+    key_fields = [
+        "book_value_per_share", "earnings_per_share", "dividends_per_share",
+        "leverage_ratio", "portfolio_size", "agency_rmbs_holdings",
+        "weighted_avg_coupon", "economic_return_pct",
+    ]
+
+    results = []
+    for model in models:
+        try:
+            response_text, metadata = await extract_with_model(
+                model=model,
+                system_prompt=system_prompt,
+                user_content=user_content,
+                max_tokens=8192,
+            )
+
+            text = response_text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1]
+                if text.endswith("```"):
+                    text = text[:-3]
+                text = text.strip()
+
+            data = json.loads(text)
+            extraction = UniversalExtraction.model_validate(data)
+
+            results.append({"model": model, "success": True, "extraction": extraction, "metadata": metadata})
+
+            # Store comparison result
+            try:
+                client.table("extraction_comparisons").insert({
+                    "document_id": document_id,
+                    "model_name": model,
+                    "extraction_data": extraction.model_dump(mode="json"),
+                    "extraction_confidence": extraction.extraction_confidence,
+                    "fields_extracted": len(extraction.fields_extracted),
+                    "input_tokens": metadata.get("input_tokens", 0),
+                    "output_tokens": metadata.get("output_tokens", 0),
+                    "estimated_cost": metadata.get("estimated_cost", 0),
+                    "latency_ms": metadata.get("latency_ms", 0),
+                }).execute()
+            except Exception as store_err:
+                logger.warning("Failed to store comparison: %s", store_err)
+
+        except Exception as e:
+            logger.error("A/B test failed for %s: %s", model, e)
+            results.append({"model": model, "success": False, "error": str(e)[:200], "metadata": {}})
+
+    # Build results HTML
+    results_cards = ""
+    baseline_cost = None
+    for r in results:
+        if not r["success"]:
+            results_cards += f"""
+            <div class="result-card" style="border-color: #ffcdd2;">
+                <h3>{r['model']}</h3>
+                <div style="color: #c62828;">Failed: {r['error']}</div>
+            </div>"""
+            continue
+
+        ext = r["extraction"]
+        meta = r["metadata"]
+        cost = meta.get("estimated_cost", 0)
+        if baseline_cost is None:
+            baseline_cost = cost
+
+        metric_rows = ""
+        for field in key_fields:
+            val = getattr(ext, field, None)
+            baseline_val = baseline.get(field) if baseline else None
+            val_str = f"{val}" if val is not None else "—"
+            css = ""
+            if baseline_val is not None and val is not None:
+                try:
+                    match = abs(float(val) - float(baseline_val)) < 0.01 * max(abs(float(baseline_val)), 1)
+                    css = "match" if match else "mismatch"
+                except (ValueError, TypeError):
+                    pass
+
+            metric_rows += f"""
+            <div class="metric-row">
+                <span class="metric-label">{field}</span>
+                <span class="metric-value {css}">{val_str}</span>
+            </div>"""
+
+        savings = ""
+        if baseline_cost and baseline_cost > 0 and cost < baseline_cost:
+            pct = (1 - cost / baseline_cost) * 100
+            savings = f' <span class="cost-savings">({pct:.0f}% savings)</span>'
+
+        results_cards += f"""
+        <div class="result-card">
+            <h3>{r['model']}</h3>
+            <div class="meta">
+                Confidence: {ext.extraction_confidence:.2f} |
+                Fields: {len(ext.fields_extracted)} |
+                Tokens: {meta.get('input_tokens', 0):,}+{meta.get('output_tokens', 0):,} |
+                Latency: {meta.get('latency_ms', 0):,}ms
+            </div>
+            {metric_rows}
+            <div class="cost">${cost:.4f}{savings}</div>
+        </div>"""
+
+    results_html = ""
+    if results:
+        results_html = f"""
+        <div class="results">
+            <h2 style="font-size: 18px;">Results — {ticker} {doc.get('title', '')}</h2>
+            <p style="font-size: 13px; color: #666;">Baseline values from existing extraction (green = match, red = mismatch)</p>
+            <div class="results-grid">{results_cards}</div>
+        </div>"""
+
+    # Rebuild page with results
+    docs_list = (
+        client.table("company_documents")
+        .select("id, company_id, document_type, title, document_date, source_url")
+        .eq("status", "completed")
+        .order("document_date", desc=True)
+        .limit(50)
+        .execute()
+    ).data
+
+    document_options = ""
+    for d in docs_list:
+        t = co_map.get(d["company_id"], "?")
+        title = d.get("title") or d.get("document_type", "?")
+        date_str = (d.get("document_date") or "")[:10]
+        selected = ' selected' if d["id"] == document_id else ''
+        document_options += f'<option value="{d["id"]}"{selected}>{t} — {title} ({date_str})</option>\n'
+
+    html = AB_TEST_TEMPLATE.format(
+        document_options=document_options,
+        results_html=results_html,
+    )
+    return HTMLResponse(content=html)

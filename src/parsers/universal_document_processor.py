@@ -20,6 +20,38 @@ from src.services.supabase_client import get_supabase_client
 logger = logging.getLogger("mreit-monitor.universal_doc_processor")
 
 
+def store_detected_document(
+    company_id: str,
+    ticker: str,
+    source_url: str,
+    document_type: str,
+    document_date: date | None,
+    title: str = "",
+    period_label: str = "",
+) -> None:
+    """
+    Store a detected document without downloading or extracting.
+
+    Called by the scheduler when a new filing is found. Sets status="detected"
+    so the user can review and approve processing from the Review page.
+    """
+    client = get_supabase_client()
+    row = {
+        "company_id": company_id,
+        "document_type": document_type,
+        "source_url": source_url,
+        "title": title or f"{ticker} {document_type}",
+        "document_date": document_date.isoformat() if document_date else None,
+        "status": "detected",
+    }
+    if period_label:
+        row["period_end"] = None  # will be set during processing
+    client.table("company_documents").upsert(
+        row, on_conflict="company_id,document_type,source_url"
+    ).execute()
+    logger.info("Stored detected document: %s %s (%s)", ticker, document_type, source_url[:80])
+
+
 async def process_document(
     company_id: str,
     company_name: str,

@@ -22,8 +22,10 @@ dependencies = [
     # PDF parsing (for 10-Q/10-K section extraction)
     "pdfplumber>=0.11.0",
     
-    # Anthropic Claude API
+    # AI providers
     "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "google-genai>=1.0.0",
     
     # Supabase
     "supabase>=2.10.0",

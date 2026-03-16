@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     scraper_model: str = "claude-haiku-4-5-20251001"
     max_extraction_retries: int = 3
 
+    # OpenAI
+    openai_api_key: str = ""
+
+    # Google Gemini
+    gemini_api_key: str = ""
+
     # Resend
     resend_api_key: str
     alert_email_to: str
