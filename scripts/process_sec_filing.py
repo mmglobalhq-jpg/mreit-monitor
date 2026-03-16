@@ -116,6 +116,7 @@ async def process_filing(
         document_date=doc_date,
         period_label=title,
         title=title,
+        skip_email=True,
     )
 
     if not success:

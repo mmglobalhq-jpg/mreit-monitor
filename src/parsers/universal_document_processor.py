@@ -30,6 +30,7 @@ async def process_document(
     document_date: date,
     period_label: str,
     title: str = "",
+    skip_email: bool = False,
 ) -> bool:
     """
     Full processing pipeline for a universal document.
@@ -156,19 +157,20 @@ async def process_document(
         }).eq("id", document_id).execute()
         return False
 
-    # Step 6: Send email alert (best effort)
-    try:
-        from src.services.email_service import send_filing_alert
+    # Step 6: Send email alert (best effort, skip for manual backfills)
+    if not skip_email:
+        try:
+            from src.services.email_service import send_filing_alert
 
-        await send_filing_alert(
-            ticker=ticker,
-            company_name=company_name,
-            filing_type_label=document_type.replace("_", " ").title(),
-            period_label=period_label,
-            source_url=source_url,
-        )
-    except Exception as e:
-        logger.warning("Email alert failed (non-blocking): %s", e)
+            await send_filing_alert(
+                ticker=ticker,
+                company_name=company_name,
+                filing_type_label=document_type.replace("_", " ").title(),
+                period_label=period_label,
+                source_url=source_url,
+            )
+        except Exception as e:
+            logger.warning("Email alert failed (non-blocking): %s", e)
 
     # Mark as completed
     client.table("company_documents").update({"status": "completed"}).eq("id", document_id).execute()
