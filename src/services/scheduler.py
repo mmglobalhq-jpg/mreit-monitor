@@ -131,6 +131,12 @@ async def poll_all_companies():
                         elif isinstance(raw, date_cls):
                             last_poll_date = raw
 
+                    # Default to 90 days lookback to avoid processing entire filing history
+                    if last_poll_date is None:
+                        from datetime import date as date_cls, timedelta
+                        last_poll_date = date_cls.today() - timedelta(days=90)
+                        logger.info("No prior filings for %s — defaulting to 90-day lookback", ticker)
+
                     edgar_filings = await check_edgar_filings(cik, since_date=last_poll_date)
 
                     for ef in edgar_filings:
