@@ -28,6 +28,7 @@ class HealthResponse(BaseModel):
     status: str
     timestamp: str
     environment: str
+    version: str = "unknown"
 
 
 class TriggerResponse(BaseModel):
@@ -52,10 +53,12 @@ class FilingStatusResponse(BaseModel):
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
     from src.config.settings import settings
+    from src.agents.summary_agent import AGENT_VERSION
     return HealthResponse(
         status="ok",
         timestamp=datetime.utcnow().isoformat(),
         environment=settings.environment,
+        version=AGENT_VERSION,
     )
 
 

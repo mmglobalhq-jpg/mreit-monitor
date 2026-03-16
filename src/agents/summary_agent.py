@@ -17,6 +17,8 @@ from src.models.summary_schemas import SummaryReport, InvestorMaterialAnalysis
 
 logger = logging.getLogger("mreit-monitor.summary_agent")
 
+AGENT_VERSION = "2.1.0"  # verification pass + dollar MoM + anti-AI-writing
+
 
 @retry(
     stop=stop_after_attempt(3),
