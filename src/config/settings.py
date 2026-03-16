@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     edgar_user_agent: str = "mREIT-Monitor contact@example.com"
 
     # Scheduler
-    poll_hour: int = 6          # Hour to run daily poll (Eastern Time)
+    poll_hour: int = 5          # Hour to run daily poll (Eastern Time)
     poll_minute: int = 0
     poll_timezone: str = "US/Eastern"
 

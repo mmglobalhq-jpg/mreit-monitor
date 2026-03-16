@@ -50,6 +50,7 @@ async def poll_all_companies():
     }
 
     total_new = 0
+    filing_details = []
 
     for company in companies:
         ticker = company["ticker"]
@@ -78,6 +79,13 @@ async def poll_all_companies():
                 universal_docs = await scrape_company_universal(registry_config, ticker)
                 new_docs = await filter_new_documents(universal_docs, company_id)
                 total_new += len(new_docs)
+                for doc in new_docs:
+                    filing_details.append({
+                        "ticker": ticker,
+                        "type": doc.document_type,
+                        "period": doc.period_label or "",
+                        "url": doc.source_url,
+                    })
 
                 log_poll(company_id, "universal_scrape", ticker, new_filings=len(new_docs))
 
@@ -154,6 +162,13 @@ async def poll_all_companies():
             if detected:
                 new_filings = await filter_new_filings(detected, company_id)
                 total_new += len(new_filings)
+                for filing in new_filings:
+                    filing_details.append({
+                        "ticker": ticker,
+                        "type": filing.filing_type.value,
+                        "period": filing.period_label or "",
+                        "url": filing.source_url,
+                    })
 
                 config = COMPANY_CONFIGS.get(ticker, {})
                 monthly_url = config.get("monthly_updates_url", "")
@@ -231,6 +246,10 @@ async def poll_all_companies():
 
     logger.info("Daily poll complete. Total new filings processed: %d", total_new)
 
+    # Send notification email if new filings were found
+    if total_new > 0:
+        await send_new_filing_notification(total_new, filing_details)
+
 
 async def generate_scheduled_summaries():
     """
@@ -288,6 +307,62 @@ async def generate_scheduled_summaries():
             logger.error("Failed to generate summary for %s: %s", ticker, e)
 
 
+async def send_new_filing_notification(total_new: int, filing_details: list[dict]):
+    """
+    Send an email to the admin when new filings are detected during the daily poll.
+    Only called when total_new > 0.
+    """
+    import resend
+    from datetime import datetime
+
+    resend.api_key = settings.resend_api_key
+
+    # Build filing list HTML
+    rows = ""
+    for f in filing_details:
+        rows += f'<tr><td>{f["ticker"]}</td><td>{f["type"]}</td><td>{f["period"]}</td><td><a href="{f["url"]}">{f["url"][:60]}...</a></td></tr>'
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }}
+        .container {{ background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 24px; }}
+        h1 {{ font-size: 18px; margin: 0 0 16px; color: #1a1a1a; }}
+        table {{ width: 100%; border-collapse: collapse; margin: 12px 0; }}
+        th, td {{ text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; font-size: 13px; }}
+        th {{ color: #888; font-weight: 600; }}
+        a {{ color: #BA0C2F; }}
+        .button {{ display: inline-block; padding: 12px 28px; background: #1a1a1a; color: #fff; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 14px; margin-top: 16px; }}
+        .footer {{ margin-top: 20px; font-size: 12px; color: #999; }}
+    </style></head>
+    <body>
+        <div class="container">
+            <h1>New REIT Filings Detected</h1>
+            <p>{total_new} new filing(s) found during the daily poll at {datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}.</p>
+            <table>
+                <tr><th>Ticker</th><th>Type</th><th>Period</th><th>Source</th></tr>
+                {rows}
+            </table>
+            <a href="https://mmglobal.us/reit-monitor/review" class="button">Review Filings</a>
+            <div class="footer">This is an automated notification from mREIT Monitor.</div>
+        </div>
+    </body>
+    </html>
+    """
+
+    try:
+        result = resend.Emails.send({
+            "from": settings.alert_email_from,
+            "to": [settings.alert_email_to],
+            "subject": f"[mREIT Monitor] {total_new} new filing(s) detected",
+            "html": html,
+        })
+        logger.info("New-filing notification sent (id: %s)", result.get("id"))
+    except Exception as e:
+        logger.error("Failed to send new-filing notification: %s", e)
+
+
 def start_scheduler() -> AsyncIOScheduler:
     """Create and start the scheduler with the daily poll job."""
     scheduler = AsyncIOScheduler()
@@ -305,18 +380,19 @@ def start_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
     
-    # Summary report generation — daily at 10am ET, job logic checks the date
-    scheduler.add_job(
-        generate_scheduled_summaries,
-        CronTrigger(
-            hour=10,
-            minute=0,
-            timezone=settings.poll_timezone,
-        ),
-        id="summary_generation",
-        name="Summary report generation",
-        replace_existing=True,
-    )
+    # Summary report generation disabled — reports are now triggered manually
+    # from the admin review page (human-in-the-loop workflow).
+    # scheduler.add_job(
+    #     generate_scheduled_summaries,
+    #     CronTrigger(
+    #         hour=10,
+    #         minute=0,
+    #         timezone=settings.poll_timezone,
+    #     ),
+    #     id="summary_generation",
+    #     name="Summary report generation",
+    #     replace_existing=True,
+    # )
 
     scheduler.start()
     return scheduler

@@ -9,6 +9,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Security
 from fastapi.security import APIKeyHeader
+from pydantic import BaseModel
 
 from src.config.settings import settings
 
@@ -299,3 +300,107 @@ async def pipeline_status():
         "recent_document_errors": _enrich(doc_errors),
         "error_count": len(filing_errors) + len(doc_errors),
     }
+
+
+# ---------------------------------------------------------------------------
+# 7. GET /api/filings/recent — recent filings for review page
+# ---------------------------------------------------------------------------
+
+@api_router.get("/filings/recent", dependencies=[Depends(require_api_key)])
+async def recent_filings(
+    days: int = Query(30, ge=1, le=90),
+):
+    """Return filings from the last N days, enriched with company ticker."""
+    from datetime import timedelta
+    from src.services.supabase_client import get_supabase_client
+
+    client = get_supabase_client()
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    result = (
+        client.table("filings")
+        .select("id, company_id, filing_type, status, source_url, filing_date, period_label, created_at")
+        .gte("created_at", since)
+        .neq("status", "skipped")
+        .order("created_at", desc=True)
+        .limit(100)
+        .execute()
+    )
+
+    # Enrich with ticker
+    companies = client.table("companies").select("id, ticker").execute().data
+    co_map = {co["id"]: co["ticker"] for co in companies}
+
+    return [
+        {
+            **row,
+            "ticker": co_map.get(row["company_id"], "?"),
+            "detected_at": row["created_at"],
+        }
+        for row in result.data
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 8. POST /api/reports/generate — on-demand report generation
+# ---------------------------------------------------------------------------
+
+class GenerateReportRequest(BaseModel):
+    ticker: str
+    report_type: str  # "monthly" | "quarterly" | "annual"
+    year: int
+    month: int | None = None
+    quarter: int | None = None
+
+
+@api_router.post("/reports/generate", dependencies=[Depends(require_api_key)])
+async def generate_report(request: GenerateReportRequest):
+    """Generate a summary report on demand (human-in-the-loop workflow)."""
+    from src.models.database import get_company_by_ticker
+    from src.services.summary_service import (
+        generate_monthly_summary,
+        generate_quarterly_summary,
+        generate_annual_summary,
+    )
+
+    co = get_company_by_ticker(request.ticker)
+    if not co:
+        raise HTTPException(status_code=404, detail=f"Company {request.ticker.upper()} not found")
+
+    try:
+        if request.report_type == "monthly":
+            if request.month is None:
+                raise HTTPException(status_code=400, detail="month is required for monthly reports")
+            result = await generate_monthly_summary(
+                company_id=co["id"],
+                company_name=co["name"],
+                ticker=co["ticker"],
+                year=request.year,
+                month=request.month,
+            )
+        elif request.report_type == "quarterly":
+            if request.quarter is None:
+                raise HTTPException(status_code=400, detail="quarter is required for quarterly reports")
+            result = await generate_quarterly_summary(
+                company_id=co["id"],
+                company_name=co["name"],
+                ticker=co["ticker"],
+                year=request.year,
+                quarter=request.quarter,
+            )
+        elif request.report_type == "annual":
+            result = await generate_annual_summary(
+                company_id=co["id"],
+                company_name=co["name"],
+                ticker=co["ticker"],
+                year=request.year,
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid report_type: {request.report_type}")
+
+        return {"status": "ok", "report": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to generate report: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))

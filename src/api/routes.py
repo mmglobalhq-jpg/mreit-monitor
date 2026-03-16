@@ -6,11 +6,22 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
 router = APIRouter()
 logger = logging.getLogger("mreit-monitor.api")
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def require_api_key(key: str | None = Security(_api_key_header)):
+    from src.config.settings import settings
+    if not settings.reit_monitor_api_key:
+        return
+    if key != settings.reit_monitor_api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 class HealthResponse(BaseModel):
@@ -52,7 +63,7 @@ async def health_check():
 # Manual Triggers
 # ============================================================================
 
-@router.post("/trigger/poll/{ticker}", response_model=TriggerResponse)
+@router.post("/trigger/poll/{ticker}", response_model=TriggerResponse, dependencies=[Depends(require_api_key)])
 async def trigger_poll(ticker: str):
     """Manually trigger a poll for a specific company. Works for all tickers."""
     from src.config.company_registry import get_company_config
@@ -137,7 +148,7 @@ class ExtractRequest(BaseModel):
     document_type: str = "quarterly_earnings"
 
 
-@router.post("/trigger/process")
+@router.post("/trigger/process", dependencies=[Depends(require_api_key)])
 async def trigger_process(source_url: str, ticker: str = "ARR", filing_type: str = "monthly_update"):
     """Manually process a specific filing by URL."""
     from src.config.company_registry import get_company_config
@@ -188,7 +199,7 @@ async def trigger_process(source_url: str, ticker: str = "ARR", filing_type: str
         )
 
 
-@router.post("/trigger/extract")
+@router.post("/trigger/extract", dependencies=[Depends(require_api_key)])
 async def trigger_extract(request: ExtractRequest):
     """Run universal extraction on a specific URL for any company."""
     from src.config.company_registry import get_company_config
@@ -223,7 +234,7 @@ async def trigger_extract(request: ExtractRequest):
     )
 
 
-@router.post("/trigger/backfill/{ticker}", response_model=TriggerResponse)
+@router.post("/trigger/backfill/{ticker}", response_model=TriggerResponse, dependencies=[Depends(require_api_key)])
 async def trigger_backfill(ticker: str):
     """Trigger historical backfill for a company."""
     import asyncio
@@ -371,7 +382,7 @@ class InvestorMaterialRequest(BaseModel):
     document_id: str
 
 
-@router.post("/summary/monthly")
+@router.post("/summary/monthly", dependencies=[Depends(require_api_key)])
 async def generate_monthly_summary(request: MonthlySummaryRequest):
     """Generate a monthly summary report."""
     from src.models.database import get_company_by_ticker
@@ -398,7 +409,7 @@ async def generate_monthly_summary(request: MonthlySummaryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/summary/quarterly")
+@router.post("/summary/quarterly", dependencies=[Depends(require_api_key)])
 async def generate_quarterly_summary(request: QuarterlySummaryRequest):
     """Generate a quarterly summary report."""
     from src.models.database import get_company_by_ticker
@@ -425,7 +436,7 @@ async def generate_quarterly_summary(request: QuarterlySummaryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/summary/annual")
+@router.post("/summary/annual", dependencies=[Depends(require_api_key)])
 async def generate_annual_summary(request: AnnualSummaryRequest):
     """Generate an annual summary report."""
     from src.models.database import get_company_by_ticker
@@ -448,7 +459,7 @@ async def generate_annual_summary(request: AnnualSummaryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/summary/investor-material")
+@router.post("/summary/investor-material", dependencies=[Depends(require_api_key)])
 async def analyze_investor_material(request: InvestorMaterialRequest):
     """Analyze an investor material document."""
     from src.models.database import get_company_by_ticker
