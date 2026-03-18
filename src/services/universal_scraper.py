@@ -220,7 +220,7 @@ async def filter_new_documents(
     urls = [d.source_url for d in detected]
 
     existing = (
-        client.table("company_documents")
+        client.table("company_documents_ML_REIT")
         .select("source_url")
         .eq("company_id", company_id)
         .in_("source_url", urls)

@@ -34,7 +34,7 @@ def _gather_period_data(
 
     # Monthly metrics
     monthly_data = (
-        client.table("monthly_metrics")
+        client.table("monthly_metrics_ML_REIT")
         .select("*")
         .eq("company_id", company_id)
         .gte("as_of_date", start_str)
@@ -45,7 +45,7 @@ def _gather_period_data(
 
     # Quarterly metrics
     quarterly_data = (
-        client.table("quarterly_metrics")
+        client.table("quarterly_metrics_ML_REIT")
         .select("*")
         .eq("company_id", company_id)
         .gte("period_end_date", start_str)
@@ -56,7 +56,7 @@ def _gather_period_data(
 
     # Agent analyses from this period
     analyses = (
-        client.table("agent_analyses")
+        client.table("agent_analyses_ML_REIT")
         .select("*")
         .eq("company_id", company_id)
         .gte("created_at", start_str)
@@ -67,7 +67,7 @@ def _gather_period_data(
 
     # Portfolio positions — get filing IDs for the period first
     filings_in_period = (
-        client.table("filings")
+        client.table("filings_ML_REIT")
         .select("id")
         .eq("company_id", company_id)
         .gte("filing_date", start_str)
@@ -79,7 +79,7 @@ def _gather_period_data(
     portfolio_data = []
     if filing_ids:
         portfolio_data = (
-            client.table("portfolio_positions")
+            client.table("portfolio_positions_ML_REIT")
             .select("*")
             .in_("filing_id", filing_ids)
             .execute()
@@ -87,7 +87,7 @@ def _gather_period_data(
 
     # CPR data
     cpr_data = (
-        client.table("cpr_data")
+        client.table("cpr_data_ML_REIT")
         .select("*")
         .eq("company_id", company_id)
         .gte("month", start_str)
@@ -124,7 +124,7 @@ def _gather_universal_data(
 
     try:
         result = (
-            client.table("universal_extractions")
+            client.table("universal_extractions_ML_REIT")
             .select("*, company_documents(document_type, document_date, title, source_url)")
             .eq("company_id", company_id)
             .gte("period_end", start_str)
@@ -168,7 +168,7 @@ def _gather_prior_period_data(
 
     # Prior monthly metrics
     prior_monthly = (
-        client.table("monthly_metrics")
+        client.table("monthly_metrics_ML_REIT")
         .select("*")
         .eq("company_id", company_id)
         .gte("as_of_date", lookback_str)
@@ -181,7 +181,7 @@ def _gather_prior_period_data(
     # Prior quarterly metrics
     quarterly_limit = 1 if report_type == "monthly" else 4
     prior_quarterly = (
-        client.table("quarterly_metrics")
+        client.table("quarterly_metrics_ML_REIT")
         .select("*")
         .eq("company_id", company_id)
         .gte("period_end_date", lookback_str)
@@ -193,7 +193,7 @@ def _gather_prior_period_data(
 
     # Prior portfolio positions — get filing IDs for monthly_update filings before the period
     prior_filings = (
-        client.table("filings")
+        client.table("filings_ML_REIT")
         .select("id, filing_date")
         .eq("company_id", company_id)
         .eq("filing_type", "monthly_update")
@@ -209,7 +209,7 @@ def _gather_prior_period_data(
     prior_positions = {}
     if prior_filing_ids:
         all_positions = (
-            client.table("portfolio_positions")
+            client.table("portfolio_positions_ML_REIT")
             .select("*")
             .in_("filing_id", prior_filing_ids)
             .execute()
@@ -258,7 +258,7 @@ def _store_summary_report(
     }
 
     result = (
-        client.table("summary_reports")
+        client.table("summary_reports_ML_REIT")
         .upsert(row, on_conflict="company_id,report_type,period_start")
         .execute()
     )
@@ -460,7 +460,7 @@ async def analyze_material(
     client = get_supabase_client()
 
     result = (
-        client.table("investor_materials")
+        client.table("investor_materials_ML_REIT")
         .select("*")
         .eq("id", document_id)
         .limit(1)
@@ -484,7 +484,7 @@ async def analyze_material(
 
     from datetime import datetime
 
-    client.table("investor_materials").update({
+    client.table("investor_materials_ML_REIT").update({
         "analysis_json": analysis.model_dump(),
         "analyzed_at": datetime.utcnow().isoformat(),
     }).eq("id", document_id).execute()

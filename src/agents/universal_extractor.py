@@ -216,7 +216,7 @@ async def store_universal_extraction(
     }
 
     result = (
-        client.table("universal_extractions")
+        client.table("universal_extractions_ML_REIT")
         .upsert(row, on_conflict="document_id")
         .execute()
     )

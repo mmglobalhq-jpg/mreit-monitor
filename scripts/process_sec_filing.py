@@ -211,7 +211,7 @@ async def process_filing(
 
     # Fix company_documents record
     doc_result = (
-        client.table("company_documents")
+        client.table("company_documents_ML_REIT")
         .update({
             "fiscal_year": fiscal_year,
             "fiscal_quarter": fiscal_quarter,
@@ -225,7 +225,7 @@ async def process_filing(
 
     # Fix universal_extractions record
     if doc_id:
-        client.table("universal_extractions").update({
+        client.table("universal_extractions_ML_REIT").update({
             "period_end": period_end,
             "fiscal_year": fiscal_year,
             "fiscal_quarter": fiscal_quarter,
@@ -236,7 +236,7 @@ async def process_filing(
     # Verify extraction
     if doc_id:
         ext = (
-            client.table("universal_extractions")
+            client.table("universal_extractions_ML_REIT")
             .select("extraction_confidence,book_value_per_share,portfolio_size,leverage_ratio,agency_rmbs_holdings")
             .eq("document_id", doc_id)
             .execute()

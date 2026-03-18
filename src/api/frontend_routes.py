@@ -84,7 +84,7 @@ async def list_reports(
 
     client = get_supabase_client()
     query = (
-        client.table("summary_reports")
+        client.table("summary_reports_ML_REIT")
         .select("id, company_id, report_type, period_label, period_start, period_end, model_used, tokens_used, email_sent, created_at, report_json")
         .order("created_at", desc=True)
         .limit(limit)
@@ -143,7 +143,7 @@ async def latest_reports(
     latest = {}
     for rtype in ("monthly", "quarterly", "annual"):
         result = (
-            client.table("summary_reports")
+            client.table("summary_reports_ML_REIT")
             .select("id, report_type, period_label, period_start, period_end, model_used, tokens_used, email_sent, created_at, report_json")
             .eq("company_id", co["id"])
             .eq("report_type", rtype)
@@ -173,7 +173,7 @@ async def get_report(report_id: str):
 
     client = get_supabase_client()
     result = (
-        client.table("summary_reports")
+        client.table("summary_reports_ML_REIT")
         .select("*")
         .eq("id", report_id)
         .limit(1)
@@ -216,7 +216,7 @@ async def list_extractions(
 
     client = get_supabase_client()
     query = (
-        client.table("universal_extractions")
+        client.table("universal_extractions_ML_REIT")
         .select("id, company_id, document_id, document_type, fiscal_year, fiscal_quarter, period_end, extraction_confidence, created_at")
         .order("created_at", desc=True)
         .limit(limit)
@@ -245,7 +245,7 @@ async def pipeline_status():
 
     # Last poll per company
     last_polls = (
-        client.table("poll_log")
+        client.table("poll_log_ML_REIT")
         .select("company_id, poll_type, completed_at, new_filings_found, error_message")
         .order("completed_at", desc=True)
         .limit(20)
@@ -254,7 +254,7 @@ async def pipeline_status():
 
     # Pending documents (status not completed/failed)
     pending = (
-        client.table("company_documents")
+        client.table("company_documents_ML_REIT")
         .select("id, company_id, document_type, status, created_at")
         .not_.is_("status", "null")
         .in_("status", ["downloaded", "extracting"])
@@ -265,7 +265,7 @@ async def pipeline_status():
 
     # Recent errors — filings
     filing_errors = (
-        client.table("filings")
+        client.table("filings_ML_REIT")
         .select("id, company_id, filing_type, period_label, status, error_message, updated_at")
         .in_("status", ["extraction_failed", "validation_failed"])
         .order("updated_at", desc=True)
@@ -275,7 +275,7 @@ async def pipeline_status():
 
     # Recent errors — documents
     doc_errors = (
-        client.table("company_documents")
+        client.table("company_documents_ML_REIT")
         .select("id, company_id, document_type, status, created_at")
         .eq("status", "failed")
         .order("created_at", desc=True)
@@ -284,7 +284,7 @@ async def pipeline_status():
     ).data
 
     # Company map for tickers
-    companies = client.table("companies").select("id, ticker").execute().data
+    companies = client.table("companies_ML_REIT").select("id, ticker").execute().data
     co_map = {co["id"]: co["ticker"] for co in companies}
 
     def _enrich(rows):
@@ -318,7 +318,7 @@ async def recent_filings(
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
 
     result = (
-        client.table("filings")
+        client.table("filings_ML_REIT")
         .select("id, company_id, filing_type, status, source_url, filing_date, period_label, created_at")
         .gte("created_at", since)
         .neq("status", "skipped")
@@ -328,7 +328,7 @@ async def recent_filings(
     )
 
     # Enrich with ticker
-    companies = client.table("companies").select("id, ticker").execute().data
+    companies = client.table("companies_ML_REIT").select("id, ticker").execute().data
     co_map = {co["id"]: co["ticker"] for co in companies}
 
     return [

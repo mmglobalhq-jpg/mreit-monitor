@@ -62,7 +62,7 @@ def seed_companies():
                 elif source.doc_type == "press_release":
                     record["news_url"] = source.url
 
-        client.table("companies").upsert(record, on_conflict="ticker").execute()
+        client.table("companies_ML_REIT").upsert(record, on_conflict="ticker").execute()
         logger.info("  Done.")
 
     logger.info("Seeding complete — %d companies.", len(COMPANY_REGISTRY))
