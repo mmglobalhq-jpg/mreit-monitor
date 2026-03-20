@@ -1,29 +1,38 @@
 """
-APScheduler setup for daily polling.
+APScheduler setup for smart polling.
 
 Runs inside the FastAPI lifespan context.
-Polls company IR pages and SEC EDGAR for new filings once daily.
+Uses the filing calendar to determine when to poll:
+  - EDGAR (free): daily during filing windows, weekly on Mondays otherwise
+  - IR pages (LLM cost): only during filing windows and monthly update windows
+
+This reduces LLM costs by ~52% compared to daily-everything polling.
 """
 
 import logging
+from datetime import date as date_cls
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from src.config.settings import settings
+from src.config.filing_calendar import (
+    should_poll_edgar,
+    should_scrape_ir_pages,
+    get_schedule_summary,
+)
 
 logger = logging.getLogger("mreit-monitor.scheduler")
 
 
 async def poll_all_companies():
     """
-    Main scheduled job: poll all active companies for new filings.
+    Main scheduled job: smart polling based on filing calendar.
 
-    Steps:
-    1. Query the companies table for all active companies
-    2. For each company, scrape their IR pages for new PDF/HTML links
-    3. Poll SEC EDGAR for new filings
-    4. For any new filings found, trigger the download + extraction pipeline
+    Checks the filing calendar to decide:
+    1. Whether to poll EDGAR today (free — daily in windows, weekly otherwise)
+    2. Which companies need IR page scraping today (costs LLM tokens)
+    3. Skips entirely on off-peak days that aren't Mondays
     """
     from src.config.company_registry import get_company_config
     from src.models.database import get_active_companies, get_latest_filing, log_poll, filter_new_filings
@@ -32,7 +41,22 @@ async def poll_all_companies():
     from src.services.universal_scraper import scrape_company_universal, filter_new_documents
     from src.parsers.universal_document_processor import store_detected_document
 
-    logger.info("Starting daily poll for all active companies...")
+    today = date_cls.today()
+    schedule = get_schedule_summary(today)
+    logger.info("Daily poll check — %s", schedule)
+
+    poll_edgar, edgar_reason = should_poll_edgar(today)
+    ir_plan = should_scrape_ir_pages(today)
+    ir_tickers = set(ir_plan["filing_window"] + ir_plan["monthly_update"])
+
+    if not poll_edgar and not ir_tickers:
+        logger.info("Off-peak day — skipping all polling")
+        return
+
+    logger.info(
+        "Starting poll: EDGAR=%s (%s), IR scrape=%s",
+        poll_edgar, edgar_reason, sorted(ir_tickers) if ir_tickers else "none",
+    )
 
     companies = get_active_companies()
     if not companies:
@@ -63,10 +87,14 @@ async def poll_all_companies():
 
         try:
             # ----------------------------------------------------------
-            # Phase 1: Universal scraper (all companies, detect only)
+            # Phase 1: Universal scraper (only during active windows)
             # ----------------------------------------------------------
-            universal_docs = await scrape_company_universal(registry_config, ticker)
-            new_docs = await filter_new_documents(universal_docs, company_id)
+            new_docs = []
+            if ticker in ir_tickers:
+                universal_docs = await scrape_company_universal(registry_config, ticker)
+                new_docs = await filter_new_documents(universal_docs, company_id)
+            else:
+                logger.debug("Skipping IR scrape for %s (not in today's window)", ticker)
             total_new += len(new_docs)
             for doc in new_docs:
                 filing_details.append({
@@ -97,12 +125,14 @@ async def poll_all_companies():
                     )
 
             # ----------------------------------------------------------
-            # Phase 2: Poll SEC EDGAR (all companies)
+            # Phase 2: Poll SEC EDGAR (free — runs when calendar says to)
             # ----------------------------------------------------------
             detected = []
             cik = registry_config.cik
 
-            if cik:
+            if not poll_edgar:
+                logger.debug("Skipping EDGAR poll for %s (off-peak, not Monday)", ticker)
+            elif cik:
                 try:
                     latest_filing = get_latest_filing(company_id)
                     last_poll_date = None

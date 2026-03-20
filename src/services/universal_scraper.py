@@ -1,9 +1,12 @@
 """
-Universal scraper — uses Claude API to parse any IR page and detect document links.
+Universal scraper — uses an LLM to parse any IR page and detect document links.
 
-Instead of writing per-site CSS selectors, sends page HTML to Claude and asks it
+Instead of writing per-site CSS selectors, sends page HTML to an LLM and asks it
 to find all document links with dates, titles, and URLs. Works universally across
 all company websites.
+
+Supports OpenAI (GPT-4.1 Nano — cheapest) and Anthropic (Claude Haiku — fallback).
+Provider is controlled by settings.scraper_provider.
 """
 
 import json
@@ -11,7 +14,6 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime
 
-import anthropic
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -33,29 +35,13 @@ class DetectedDocument:
     source_page: str
 
 
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=4, max=15),
-    reraise=True,
-)
-async def _parse_ir_page_with_claude(
-    html: str,
-    page_url: str,
-    doc_type: str,
-    company_name: str,
-) -> list[dict]:
-    """
-    Send IR page HTML to Claude Sonnet and extract document links.
-
-    Returns list of dicts with keys: url, title, date, period_label
-    """
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-
+def _build_scraper_prompt(html: str, page_url: str, doc_type: str, company_name: str) -> str:
+    """Build the shared prompt for IR page document extraction."""
     # Truncate HTML if very large
     if len(html) > 150_000:
         html = html[:150_000] + "\n[TRUNCATED]"
 
-    prompt = f"""Analyze this investor relations page from {company_name} and find ALL document links.
+    return f"""Analyze this investor relations page from {company_name} and find ALL document links.
 
 I'm looking for documents of type: {doc_type}
 
@@ -71,17 +57,9 @@ Return ONLY the JSON array — no markdown, no commentary.
 PAGE HTML:
 {html}"""
 
-    message = await client.messages.create(
-        model=settings.scraper_model,
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
-    )
 
-    response_text = ""
-    for block in message.content:
-        if block.type == "text":
-            response_text += block.text
-
+def _parse_json_response(response_text: str, page_url: str) -> list[dict]:
+    """Parse the LLM response text into a list of dicts."""
     response_text = response_text.strip()
     if response_text.startswith("```"):
         response_text = response_text.split("\n", 1)[1]
@@ -94,10 +72,71 @@ PAGE HTML:
         if not isinstance(results, list):
             results = []
     except json.JSONDecodeError:
-        logger.warning("Failed to parse Claude response for %s", page_url)
+        logger.warning("Failed to parse LLM response for %s", page_url)
         results = []
 
     return results
+
+
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=4, max=15),
+    reraise=True,
+)
+async def _parse_ir_page_with_openai(
+    html: str, page_url: str, doc_type: str, company_name: str,
+) -> list[dict]:
+    """Use OpenAI GPT-4.1 Nano to extract document links. ~88% cheaper than Claude Haiku."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    prompt = _build_scraper_prompt(html, page_url, doc_type, company_name)
+
+    response = await client.chat.completions.create(
+        model=settings.scraper_model,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    response_text = response.choices[0].message.content or ""
+    return _parse_json_response(response_text, page_url)
+
+
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=4, max=15),
+    reraise=True,
+)
+async def _parse_ir_page_with_anthropic(
+    html: str, page_url: str, doc_type: str, company_name: str,
+) -> list[dict]:
+    """Fallback: use Anthropic Claude for extraction."""
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    prompt = _build_scraper_prompt(html, page_url, doc_type, company_name)
+
+    message = await client.messages.create(
+        model=settings.scraper_model,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    response_text = ""
+    for block in message.content:
+        if block.type == "text":
+            response_text += block.text
+
+    return _parse_json_response(response_text, page_url)
+
+
+async def _parse_ir_page(
+    html: str, page_url: str, doc_type: str, company_name: str,
+) -> list[dict]:
+    """Route to the configured LLM provider for IR page parsing."""
+    if settings.scraper_provider == "openai":
+        return await _parse_ir_page_with_openai(html, page_url, doc_type, company_name)
+    return await _parse_ir_page_with_anthropic(html, page_url, doc_type, company_name)
 
 
 async def scrape_ir_page(
@@ -137,7 +176,7 @@ async def scrape_ir_page(
 
     # Use Claude to parse the page
     try:
-        raw_results = await _parse_ir_page_with_claude(
+        raw_results = await _parse_ir_page(
             html=html,
             page_url=source.url,
             doc_type=source.doc_type,

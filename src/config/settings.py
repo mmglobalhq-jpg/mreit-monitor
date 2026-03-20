@@ -18,7 +18,8 @@ class Settings(BaseSettings):
     anthropic_api_key: str
     extraction_model: str = "claude-sonnet-4-20250514"
     comparison_model: str = "claude-opus-4-20250514"
-    scraper_model: str = "claude-haiku-4-5-20251001"
+    scraper_model: str = "gpt-4.1-nano"
+    scraper_provider: str = "openai"  # "openai" or "anthropic"
     max_extraction_retries: int = 3
 
     # OpenAI
