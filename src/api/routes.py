@@ -281,7 +281,7 @@ async def list_filings(ticker: str, filing_type: str | None = None, limit: int =
 
     client = get_supabase_client()
     query = (
-        client.table("filings_ML_REIT")
+        client.table("filings")
         .select("filing_type, period_label, status, filing_date, completed_at")
         .eq("company_id", company["id"])
         .order("filing_date", desc=True)
@@ -445,7 +445,7 @@ async def get_latest_summary(ticker: str):
 
     client = get_supabase_client()
     result = (
-        client.table("summary_reports_ML_REIT")
+        client.table("summary_reports")
         .select("*")
         .eq("company_id", company["id"])
         .order("created_at", desc=True)

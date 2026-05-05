@@ -25,6 +25,213 @@ from src.config.filing_calendar import (
 logger = logging.getLogger("mreit-monitor.scheduler")
 
 
+async def poll_ir_pages_only():
+    """
+    Hourly job: scrape IR pages only — no EDGAR.
+    Free since the switch to BS4 tier 1 / Qwen3 fallback.
+    Skips if the filing calendar says no companies are due today.
+    """
+    from src.config.company_registry import get_company_config
+    from src.models.database import get_active_companies, log_poll
+    from src.services.universal_scraper import scrape_company_universal, filter_new_documents
+    from src.parsers.universal_document_processor import store_detected_document
+
+    today = date_cls.today()
+    ir_plan = should_scrape_ir_pages(today)
+    ir_tickers = set(ir_plan["filing_window"] + ir_plan["monthly_update"])
+
+    if not ir_tickers:
+        logger.debug("Hourly IR scrape: no companies due today — skipping")
+        return
+
+    logger.info("Hourly IR scrape starting — companies due: %s", sorted(ir_tickers))
+    companies = get_active_companies()
+    total_new = 0
+    filing_details = []
+
+    for company in companies:
+        ticker = company["ticker"]
+        company_id = company["id"]
+
+        if ticker not in ir_tickers:
+            continue
+
+        registry_config = get_company_config(ticker)
+        if not registry_config:
+            logger.warning("No config for %s — skipping", ticker)
+            continue
+
+        try:
+            universal_docs = await scrape_company_universal(registry_config, ticker)
+            new_docs = await filter_new_documents(universal_docs, company_id)
+            total_new += len(new_docs)
+
+            for doc in new_docs:
+                filing_details.append({
+                    "ticker": ticker,
+                    "type": doc.document_type,
+                    "period": doc.period_label or "",
+                    "url": doc.source_url,
+                })
+                try:
+                    store_detected_document(
+                        company_id=company_id,
+                        ticker=ticker,
+                        source_url=doc.source_url,
+                        document_type=doc.document_type,
+                        document_date=doc.document_date,
+                        title=doc.title,
+                        period_label=doc.period_label or "",
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to store detected %s %s %s: %s",
+                        ticker, doc.document_type, doc.period_label, e,
+                    )
+
+            log_poll(company_id, "universal_scrape", ticker, new_filings=len(new_docs))
+
+        except Exception as e:
+            logger.error("IR scrape failed for %s: %s", ticker, e)
+            try:
+                log_poll(company_id, "ir_scrape", "", error=str(e)[:500])
+            except Exception:
+                pass
+
+    logger.info("Hourly IR scrape complete. New documents: %d", total_new)
+    if total_new > 0:
+        await send_new_filing_notification(total_new, filing_details)
+
+
+async def poll_edgar_only():
+    """
+    Daily job: poll SEC EDGAR only — no IR scrape.
+    Free. Respects the filing calendar (daily in windows, weekly on Mondays otherwise).
+    """
+    from src.config.company_registry import get_company_config
+    from src.models.database import get_active_companies, get_latest_filing, log_poll, filter_new_filings
+    from src.models.schemas import FilingType, DetectedFiling
+    from src.services.edgar import check_new_filings as check_edgar_filings
+    from src.parsers.universal_document_processor import store_detected_document
+
+    today = date_cls.today()
+    poll_edgar, edgar_reason = should_poll_edgar(today)
+
+    if not poll_edgar:
+        logger.info("Daily EDGAR check: off-peak day — skipping (%s)", edgar_reason)
+        return
+
+    logger.info("Daily EDGAR check starting (%s)", edgar_reason)
+    companies = get_active_companies()
+    total_new = 0
+    filing_details = []
+
+    _FORM_TYPE_MAP = {
+        "10-Q": FilingType.QUARTERLY_10Q,
+        "10-Q/A": FilingType.QUARTERLY_10Q,
+        "10-K": FilingType.ANNUAL_10K,
+        "10-K/A": FilingType.ANNUAL_10K,
+        "8-K": FilingType.OTHER,
+    }
+    _DOC_TYPE_MAP = {
+        "earnings_release": "quarterly_earnings",
+        "quarterly_10q": "quarterly_10q",
+        "annual_10k": "annual_10k",
+        "monthly_update": "monthly_update",
+    }
+
+    for company in companies:
+        ticker = company["ticker"]
+        company_id = company["id"]
+        registry_config = get_company_config(ticker)
+        if not registry_config:
+            logger.warning("No config for %s — skipping", ticker)
+            continue
+
+        cik = registry_config.cik
+        if not cik:
+            logger.debug("No CIK for %s — skipping EDGAR", ticker)
+            continue
+
+        try:
+            latest_filing = get_latest_filing(company_id)
+            last_poll_date = None
+            if latest_filing and latest_filing.get("filing_date"):
+                from datetime import datetime as datetime_cls
+                raw = latest_filing["filing_date"]
+                if isinstance(raw, str):
+                    last_poll_date = datetime_cls.strptime(raw[:10], "%Y-%m-%d").date()
+                elif isinstance(raw, date_cls):
+                    last_poll_date = raw
+
+            if last_poll_date is None:
+                from datetime import timedelta
+                last_poll_date = date_cls.today() - timedelta(days=90)
+                logger.info("No prior filings for %s — defaulting to 90-day lookback", ticker)
+
+            edgar_filings = await check_edgar_filings(cik, since_date=last_poll_date)
+            detected = []
+
+            for ef in edgar_filings:
+                filing_type = _FORM_TYPE_MAP.get(ef.form_type, FilingType.OTHER)
+                period_label = f"{ef.form_type} {ef.filing_date.isoformat()}"
+                detected.append(DetectedFiling(
+                    source_url=ef.primary_document_url,
+                    filing_type=filing_type,
+                    filing_date=ef.filing_date,
+                    period_label=period_label,
+                    source_page=f"edgar:{cik}",
+                ))
+
+            logger.info(
+                "EDGAR check %s (CIK %s): %d filings found",
+                ticker, cik, len(edgar_filings),
+            )
+            log_poll(company_id, "edgar", f"CIK:{cik}", new_filings=len(edgar_filings))
+
+            if detected:
+                new_filings = await filter_new_filings(detected, company_id)
+                total_new += len(new_filings)
+
+                for filing in new_filings:
+                    filing_details.append({
+                        "ticker": ticker,
+                        "type": filing.filing_type.value,
+                        "period": filing.period_label or "",
+                        "url": filing.source_url,
+                    })
+                    filing_type_val = filing.filing_type.value
+                    if filing_type_val in _DOC_TYPE_MAP:
+                        try:
+                            store_detected_document(
+                                company_id=company_id,
+                                ticker=ticker,
+                                source_url=filing.source_url,
+                                document_type=_DOC_TYPE_MAP[filing_type_val],
+                                document_date=filing.filing_date,
+                                title=f"{ticker} {filing.period_label}",
+                                period_label=filing.period_label or "",
+                            )
+                        except Exception as e:
+                            logger.error(
+                                "Failed to store detected %s %s %s: %s",
+                                ticker, filing_type_val, filing.period_label, e,
+                            )
+
+                log_poll(company_id, "edgar", f"CIK:{cik}", new_filings=len(new_filings))
+
+        except Exception as e:
+            logger.error("EDGAR check failed for %s (CIK %s): %s", ticker, cik, e)
+            try:
+                log_poll(company_id, "edgar", f"CIK:{cik}", error=str(e)[:500])
+            except Exception:
+                pass
+
+    logger.info("Daily EDGAR check complete. New filings: %d", total_new)
+    if total_new > 0:
+        await send_new_filing_notification(total_new, filing_details)
+
+
 async def poll_all_companies():
     """
     Main scheduled job: smart polling based on filing calendar.
@@ -352,35 +559,35 @@ async def send_new_filing_notification(total_new: int, filing_details: list[dict
 
 
 def start_scheduler() -> AsyncIOScheduler:
-    """Create and start the scheduler with the daily poll job."""
+    """Create and start the scheduler with two jobs: hourly IR scrape + daily EDGAR check."""
     scheduler = AsyncIOScheduler()
-    
-    # Daily poll at configured time
+
+    # Hourly IR page scrape — market hours Mon-Fri, top of each hour
     scheduler.add_job(
-        poll_all_companies,
+        poll_ir_pages_only,
+        CronTrigger(
+            hour="6-20",
+            day_of_week="mon-fri",
+            timezone="US/Eastern",
+        ),
+        id="hourly_ir_scrape",
+        name="Hourly mREIT IR page scrape",
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+
+    # Daily EDGAR check at configured time
+    scheduler.add_job(
+        poll_edgar_only,
         CronTrigger(
             hour=settings.poll_hour,
             minute=settings.poll_minute,
             timezone=settings.poll_timezone,
         ),
-        id="daily_poll",
-        name="Daily mREIT filing poll",
+        id="daily_edgar",
+        name="Daily EDGAR filing check",
         replace_existing=True,
     )
-    
-    # Summary report generation disabled — reports are now triggered manually
-    # from the admin review page (human-in-the-loop workflow).
-    # scheduler.add_job(
-    #     generate_scheduled_summaries,
-    #     CronTrigger(
-    #         hour=10,
-    #         minute=0,
-    #         timezone=settings.poll_timezone,
-    #     ),
-    #     id="summary_generation",
-    #     name="Summary report generation",
-    #     replace_existing=True,
-    # )
 
     scheduler.start()
     return scheduler

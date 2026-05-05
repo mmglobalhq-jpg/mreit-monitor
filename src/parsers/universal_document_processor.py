@@ -47,7 +47,7 @@ def store_detected_document(
     }
     if period_label:
         row["period_end"] = None  # will be set during processing
-    client.table("company_documents_ML_REIT").upsert(
+    client.table("company_documents").upsert(
         row, on_conflict="company_id,document_type,source_url"
     ).execute()
     logger.info("Stored detected document: %s %s (%s)", ticker, document_type, source_url[:80])
@@ -134,7 +134,7 @@ async def process_document(
 
     try:
         result = (
-            client.table("company_documents_ML_REIT")
+            client.table("company_documents")
             .upsert(doc_row, on_conflict="company_id,document_type,source_url")
             .execute()
         )
@@ -156,14 +156,14 @@ async def process_document(
                 response.content,
                 {"content-type": "application/pdf"},
             )
-            client.table("company_documents_ML_REIT").update({"file_path": storage_path}).eq("id", document_id).execute()
+            client.table("company_documents").update({"file_path": storage_path}).eq("id", document_id).execute()
             logger.info("Uploaded PDF to storage: %s", storage_path)
         except Exception as e:
             logger.warning("Storage upload failed (continuing): %s", e)
 
     # Step 4: Run universal extraction
     try:
-        client.table("company_documents_ML_REIT").update({"status": "extracting"}).eq("id", document_id).execute()
+        client.table("company_documents").update({"status": "extracting"}).eq("id", document_id).execute()
 
         extraction, metadata = await extract_document(
             content=raw_content,
@@ -176,7 +176,7 @@ async def process_document(
         # Step 5: Store extraction
         await store_universal_extraction(extraction, document_id, company_id)
 
-        client.table("company_documents_ML_REIT").update({"status": "extracted"}).eq("id", document_id).execute()
+        client.table("company_documents").update({"status": "extracted"}).eq("id", document_id).execute()
 
         logger.info(
             "Successfully extracted %s for %s (confidence=%.2f)",
@@ -185,7 +185,7 @@ async def process_document(
 
     except Exception as e:
         logger.error("Extraction failed for %s %s: %s", ticker, document_type, e)
-        client.table("company_documents_ML_REIT").update({
+        client.table("company_documents").update({
             "status": "failed",
         }).eq("id", document_id).execute()
         return False
@@ -206,6 +206,6 @@ async def process_document(
             logger.warning("Email alert failed (non-blocking): %s", e)
 
     # Mark as completed
-    client.table("company_documents_ML_REIT").update({"status": "completed"}).eq("id", document_id).execute()
+    client.table("company_documents").update({"status": "completed"}).eq("id", document_id).execute()
 
     return True

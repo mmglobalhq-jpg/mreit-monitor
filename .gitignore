@@ -1,11 +1,32 @@
+﻿# Environment
 .env
-.DS_Store
+.env.local
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+.venv/
+venv/
 *.egg-info/
 dist/
 build/
-*.zip
-.venv/
-venv/
-supabase/.temp/
+.uv/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

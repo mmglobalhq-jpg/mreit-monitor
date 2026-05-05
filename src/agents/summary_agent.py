@@ -5,19 +5,33 @@ Consumes extracted data from Supabase and produces structured summary reports
 on monthly/quarterly/annual cadences.
 """
 
+import asyncio
 import json
 import logging
 
-import anthropic
 import httpx
+from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config.settings import settings
 from src.models.summary_schemas import SummaryReport, InvestorMaterialAnalysis
+from src.services.metering import record_llm_call
 
 logger = logging.getLogger("mreit-monitor.summary_agent")
 
 AGENT_VERSION = "2.1.0"  # verification pass + dollar MoM + anti-AI-writing
+
+
+def _openrouter_client() -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=settings.openrouter_api_key,
+        base_url=settings.openrouter_base_url,
+        default_headers={
+            "HTTP-Referer": "https://hq.mmglobal.us",
+            "X-Title": "Tom Bot mREIT Monitor",
+        },
+        timeout=httpx.Timeout(timeout=600.0, connect=10.0),
+    )
 
 
 @retry(
@@ -51,10 +65,7 @@ async def generate_summary_report(
         SUMMARY_REPORT_USER,
     )
 
-    client = anthropic.AsyncAnthropic(
-        api_key=settings.anthropic_api_key,
-        timeout=httpx.Timeout(timeout=600.0, connect=5.0),
-    )
+    client = _openrouter_client()
     schema_json = json.dumps(SummaryReport.model_json_schema(), indent=2)
 
     user_message = SUMMARY_REPORT_USER.format(
@@ -81,15 +92,33 @@ async def generate_summary_report(
     )
 
     response_text = ""
-    async with client.messages.stream(
+    input_tokens = 0
+    output_tokens = 0
+
+    stream = await client.chat.completions.create(
         model=settings.summary_model,
         max_tokens=12288,
-        system=SUMMARY_REPORT_SYSTEM,
-        messages=[{"role": "user", "content": user_message}],
-    ) as stream:
-        async for text in stream.text_stream:
-            response_text += text
-        message = await stream.get_final_message()
+        messages=[
+            {"role": "system", "content": SUMMARY_REPORT_SYSTEM},
+            {"role": "user", "content": user_message},
+        ],
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    async for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            response_text += chunk.choices[0].delta.content
+        if chunk.usage:
+            input_tokens = chunk.usage.prompt_tokens
+            output_tokens = chunk.usage.completion_tokens
+
+    asyncio.create_task(record_llm_call(
+        provider="openrouter",
+        model=settings.summary_model,
+        prompt_tokens=input_tokens,
+        completion_tokens=output_tokens,
+        feature="reit_summary",
+    ))
 
     response_text = response_text.strip()
     if response_text.startswith("```"):
@@ -121,12 +150,11 @@ async def generate_summary_report(
 
     metadata = {
         "model": settings.summary_model,
-        "input_tokens": message.usage.input_tokens,
-        "output_tokens": message.usage.output_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
         "raw_response": response_text,
     }
 
-    # ── Verification pass ──────────────────────────────────────────
     report, metadata = await _verify_and_correct(
         report, metadata, data_context, client,
         company_name, ticker, period_label, report_type,
@@ -139,14 +167,14 @@ async def _verify_and_correct(
     report: SummaryReport,
     metadata: dict,
     data_context: dict,
-    client: anthropic.AsyncAnthropic,
+    client: AsyncOpenAI,
     company_name: str,
     ticker: str,
     period_label: str,
     report_type: str,
 ) -> tuple[SummaryReport, dict]:
     """
-    Send the generated report + source data to Claude for fact-checking.
+    Send the generated report + source data to the model for fact-checking.
     If errors are found, regenerate with corrections appended as guidance.
     """
     from src.agents.prompts.summary_templates import (
@@ -168,14 +196,16 @@ async def _verify_and_correct(
     logger.info("Running verification pass for %s %s", ticker, period_label)
 
     try:
-        verify_response = await client.messages.create(
+        verify_response = await client.chat.completions.create(
             model=settings.summary_model,
             max_tokens=4096,
-            system=VERIFICATION_SYSTEM,
-            messages=[{"role": "user", "content": verification_msg}],
+            messages=[
+                {"role": "system", "content": VERIFICATION_SYSTEM},
+                {"role": "user", "content": verification_msg},
+            ],
         )
 
-        verify_text = verify_response.content[0].text.strip()
+        verify_text = (verify_response.choices[0].message.content or "").strip()
         if verify_text.startswith("```"):
             verify_text = verify_text.split("\n", 1)[1]
             if verify_text.endswith("```"):
@@ -185,9 +215,17 @@ async def _verify_and_correct(
         verification = json.loads(verify_text)
         errors = verification.get("errors", [])
         metadata["verification_tokens"] = {
-            "input": verify_response.usage.input_tokens,
-            "output": verify_response.usage.output_tokens,
+            "input": verify_response.usage.prompt_tokens if verify_response.usage else 0,
+            "output": verify_response.usage.completion_tokens if verify_response.usage else 0,
         }
+
+        asyncio.create_task(record_llm_call(
+            provider="openrouter",
+            model=settings.summary_model,
+            prompt_tokens=metadata["verification_tokens"]["input"],
+            completion_tokens=metadata["verification_tokens"]["output"],
+            feature="reit_summary_verify",
+        ))
 
         if not errors:
             logger.info("Verification passed — no errors found")
@@ -197,7 +235,6 @@ async def _verify_and_correct(
         logger.warning("Verification found %d error(s), regenerating", len(errors))
         metadata["verification_errors"] = errors
 
-        # Regenerate with corrections as guidance
         corrections_text = "\n".join(
             f"- CORRECTION: \"{e.get('claim', '')}\" is wrong. "
             f"Source says: {e.get('source_value', '')}. "
@@ -226,15 +263,33 @@ async def _verify_and_correct(
         user_message += f"\n\nIMPORTANT — A prior draft had these errors. Fix them:\n{corrections_text}"
 
         regen_text = ""
-        async with client.messages.stream(
+        regen_input_tokens = 0
+        regen_output_tokens = 0
+
+        regen_stream = await client.chat.completions.create(
             model=settings.summary_model,
             max_tokens=12288,
-            system=SUMMARY_REPORT_SYSTEM,
-            messages=[{"role": "user", "content": user_message}],
-        ) as stream:
-            async for text in stream.text_stream:
-                regen_text += text
-            regen_msg = await stream.get_final_message()
+            messages=[
+                {"role": "system", "content": SUMMARY_REPORT_SYSTEM},
+                {"role": "user", "content": user_message},
+            ],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        async for chunk in regen_stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                regen_text += chunk.choices[0].delta.content
+            if chunk.usage:
+                regen_input_tokens = chunk.usage.prompt_tokens
+                regen_output_tokens = chunk.usage.completion_tokens
+
+        asyncio.create_task(record_llm_call(
+            provider="openrouter",
+            model=settings.summary_model,
+            prompt_tokens=regen_input_tokens,
+            completion_tokens=regen_output_tokens,
+            feature="reit_summary_regen",
+        ))
 
         regen_text = regen_text.strip()
         if regen_text.startswith("```"):
@@ -248,8 +303,8 @@ async def _verify_and_correct(
 
         metadata["regenerated"] = True
         metadata["regen_tokens"] = {
-            "input": regen_msg.usage.input_tokens,
-            "output": regen_msg.usage.output_tokens,
+            "input": regen_input_tokens,
+            "output": regen_output_tokens,
         }
         metadata["raw_response"] = regen_text
         logger.info("Regenerated report with %d corrections applied", len(errors))
@@ -284,7 +339,7 @@ async def analyze_investor_material(
         INVESTOR_MATERIAL_USER,
     )
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = _openrouter_client()
     schema_json = json.dumps(InvestorMaterialAnalysis.model_json_schema(), indent=2)
 
     user_message = INVESTOR_MATERIAL_USER.format(
@@ -297,19 +352,16 @@ async def analyze_investor_material(
 
     logger.info("Analyzing %s for %s", material_type, ticker)
 
-    message = await client.messages.create(
+    response = await client.chat.completions.create(
         model=settings.summary_model,
         max_tokens=4096,
-        system=INVESTOR_MATERIAL_SYSTEM,
-        messages=[{"role": "user", "content": user_message}],
+        messages=[
+            {"role": "system", "content": INVESTOR_MATERIAL_SYSTEM},
+            {"role": "user", "content": user_message},
+        ],
     )
 
-    response_text = ""
-    for block in message.content:
-        if block.type == "text":
-            response_text += block.text
-
-    response_text = response_text.strip()
+    response_text = (response.choices[0].message.content or "").strip()
     if response_text.startswith("```"):
         response_text = response_text.split("\n", 1)[1]
         if response_text.endswith("```"):
@@ -325,9 +377,17 @@ async def analyze_investor_material(
 
     metadata = {
         "model": settings.summary_model,
-        "input_tokens": message.usage.input_tokens,
-        "output_tokens": message.usage.output_tokens,
+        "input_tokens": response.usage.prompt_tokens if response.usage else 0,
+        "output_tokens": response.usage.completion_tokens if response.usage else 0,
         "raw_response": response_text,
     }
+
+    asyncio.create_task(record_llm_call(
+        provider="openrouter",
+        model=settings.summary_model,
+        prompt_tokens=metadata["input_tokens"],
+        completion_tokens=metadata["output_tokens"],
+        feature="reit_investor_material",
+    ))
 
     return analysis, metadata

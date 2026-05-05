@@ -96,7 +96,7 @@ def _check_quarter_complete(
     client = get_supabase_client()
 
     result = (
-        client.table("company_documents_ML_REIT")
+        client.table("company_documents")
         .select("document_type")
         .eq("company_id", company_id)
         .eq("fiscal_quarter", fiscal_quarter)

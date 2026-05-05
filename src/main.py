@@ -37,7 +37,10 @@ async def lifespan(app: FastAPI):
 
     logger.info("Starting mREIT Monitor...")
     scheduler = start_scheduler()
-    logger.info("Scheduler started. Daily poll at %d:%02d %s", settings.poll_hour, settings.poll_minute, settings.poll_timezone)
+    logger.info(
+        "Scheduler started. IR scrape: hourly Mon-Fri 6-20 ET. EDGAR check: daily %d:%02d %s",
+        settings.poll_hour, settings.poll_minute, settings.poll_timezone,
+    )
 
     yield
 
@@ -74,6 +77,17 @@ from src.api.frontend_routes import api_router  # noqa: E402
 app.include_router(router)
 app.include_router(review_router)
 app.include_router(api_router)
+
+# MCP endpoint — Tom Bot connects to http://127.0.0.1:8012/mcp
+from fastapi_mcp import FastApiMCP  # noqa: E402
+
+mcp = FastApiMCP(
+    app,
+    name="reit_monitor",
+    describe_all_responses=True,
+    describe_full_response_schema=True,
+)
+mcp.mount()
 
 
 if __name__ == "__main__":

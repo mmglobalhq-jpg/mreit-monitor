@@ -1,12 +1,9 @@
 """
-Universal scraper — uses an LLM to parse any IR page and detect document links.
+Universal scraper — uses a local LLM to parse any IR page and detect document links.
 
-Instead of writing per-site CSS selectors, sends page HTML to an LLM and asks it
-to find all document links with dates, titles, and URLs. Works universally across
-all company websites.
-
-Supports OpenAI (GPT-4.1 Nano — cheapest) and Anthropic (Claude Haiku — fallback).
-Provider is controlled by settings.scraper_provider.
+Instead of writing per-site CSS selectors, sends page HTML to Ollama/Qwen3:4b and
+asks it to find all document links with dates, titles, and URLs. Works universally
+across all company websites. Free — no API cost.
 """
 
 import json
@@ -15,10 +12,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config.company_registry import CompanyConfig, ScrapeSource
-from src.config.settings import settings
 from src.services.supabase_client import get_supabase_client
 
 logger = logging.getLogger("mreit-monitor.universal_scraper")
@@ -78,65 +73,109 @@ def _parse_json_response(response_text: str, page_url: str) -> list[dict]:
     return results
 
 
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=4, max=15),
-    reraise=True,
-)
-async def _parse_ir_page_with_openai(
-    html: str, page_url: str, doc_type: str, company_name: str,
-) -> list[dict]:
-    """Use OpenAI GPT-4.1 Nano to extract document links. ~88% cheaper than Claude Haiku."""
-    from openai import AsyncOpenAI
+def _parse_ir_page_with_bs4(html: str, page_url: str, doc_type: str) -> list[dict]:
+    """
+    Fast link extraction using BeautifulSoup. No LLM cost.
+    Returns list of {url, title, date, period_label} dicts.
+    """
+    import re
+    from datetime import date as date_cls
+    from urllib.parse import urljoin
 
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
-    prompt = _build_scraper_prompt(html, page_url, doc_type, company_name)
+    from bs4 import BeautifulSoup
 
-    response = await client.chat.completions.create(
-        model=settings.scraper_model,
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    soup = BeautifulSoup(html, "lxml")
+    results = []
+    seen_urls: set[str] = set()
 
-    response_text = response.choices[0].message.content or ""
-    return _parse_json_response(response_text, page_url)
+    DOC_KEYWORDS = [
+        "monthly", "update", "earnings", "quarterly", "10-q", "10-k", "8-k",
+        "press release", "investor presentation", "supplement", "financial",
+        "report", "filing", "results", "dividend", "portfolio",
+    ]
 
+    DATE_PATTERNS = [
+        r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{4}",
+        r"q[1-4]\s+\d{4}",
+        r"\d{1,2}/\d{1,2}/\d{4}",
+        r"\d{4}-\d{2}-\d{2}",
+    ]
 
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=4, max=15),
-    reraise=True,
-)
-async def _parse_ir_page_with_anthropic(
-    html: str, page_url: str, doc_type: str, company_name: str,
-) -> list[dict]:
-    """Fallback: use Anthropic Claude for extraction."""
-    import anthropic
+    MONTH_MAP = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
+    }
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    prompt = _build_scraper_prompt(html, page_url, doc_type, company_name)
+    for tag in soup.find_all("a", href=True):
+        href = tag.get("href", "")
+        text = tag.get_text(strip=True)
+        full_url = urljoin(page_url, href)
 
-    message = await client.messages.create(
-        model=settings.scraper_model,
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
-    )
+        if not text or full_url in seen_urls:
+            continue
 
-    response_text = ""
-    for block in message.content:
-        if block.type == "text":
-            response_text += block.text
+        is_doc_link = (
+            href.lower().endswith((".pdf", ".htm", ".html")) or
+            any(kw in text.lower() for kw in DOC_KEYWORDS)
+        )
+        if not is_doc_link:
+            continue
 
-    return _parse_json_response(response_text, page_url)
+        context_text = text
+        parent = tag.parent
+        if parent:
+            context_text = parent.get_text(strip=True)
+
+        doc_date = date_cls.today()
+        period_label = ""
+
+        for pattern in DATE_PATTERNS:
+            match = re.search(pattern, context_text.lower())
+            if match:
+                matched = match.group(0)
+                month_match = re.match(r"(\w+)\s+(\d{4})", matched)
+                if month_match:
+                    month_name = month_match.group(1)
+                    year = int(month_match.group(2))
+                    if month_name in MONTH_MAP:
+                        doc_date = date_cls(year, MONTH_MAP[month_name], 1)
+                        period_label = f"{month_match.group(1).title()} {year}"
+                        break
+                q_match = re.match(r"q([1-4])\s+(\d{4})", matched)
+                if q_match:
+                    quarter = int(q_match.group(1))
+                    year = int(q_match.group(2))
+                    doc_date = date_cls(year, quarter * 3, 1)
+                    period_label = f"Q{quarter} {year}"
+                    break
+
+        seen_urls.add(full_url)
+        results.append({
+            "url": full_url,
+            "title": text,
+            "date": doc_date.isoformat(),
+            "period_label": period_label or text[:50],
+        })
+
+    return results
 
 
 async def _parse_ir_page(
     html: str, page_url: str, doc_type: str, company_name: str,
 ) -> list[dict]:
-    """Route to the configured LLM provider for IR page parsing."""
-    if settings.scraper_provider == "openai":
-        return await _parse_ir_page_with_openai(html, page_url, doc_type, company_name)
-    return await _parse_ir_page_with_anthropic(html, page_url, doc_type, company_name)
+    # Tier 1: BeautifulSoup — instant, no LLM
+    results = _parse_ir_page_with_bs4(html, page_url, doc_type)
+    if results:
+        logger.info("BeautifulSoup found %d links on %s (no LLM needed)", len(results), page_url)
+        return results
+
+    # Tier 2: Qwen3 fallback — only when BS4 finds nothing
+    logger.info("BeautifulSoup found nothing on %s — falling back to Qwen3", page_url)
+    from src.agents.model_router import scrape_with_local_model
+    prompt = _build_scraper_prompt(html, page_url, doc_type, company_name)
+    response_text = await scrape_with_local_model(prompt)
+    return _parse_json_response(response_text, page_url)
 
 
 async def scrape_ir_page(
@@ -174,7 +213,6 @@ async def scrape_ir_page(
 
     html = response.text
 
-    # Use Claude to parse the page
     try:
         raw_results = await _parse_ir_page(
             html=html,
@@ -183,7 +221,7 @@ async def scrape_ir_page(
             company_name=company_config.name,
         )
     except Exception as e:
-        logger.error("Claude parsing failed for %s: %s", source.url, e)
+        logger.error("Parsing failed for %s: %s", source.url, e)
         return []
 
     # Convert to DetectedDocument objects
@@ -259,7 +297,7 @@ async def filter_new_documents(
     urls = [d.source_url for d in detected]
 
     existing = (
-        client.table("company_documents_ML_REIT")
+        client.table("company_documents")
         .select("source_url")
         .eq("company_id", company_id)
         .in_("source_url", urls)
