@@ -527,20 +527,21 @@ async def process_detected_backlog():
     Every-15-min job: pick up to 5 documents stuck at status='detected' and run
     the full download → extract pipeline on each.
 
-    After each successful extraction, checks whether a summary report should be
-    generated for that company and fires one in the background if so.
+    After extraction, generates a summary only for documents detected within the
+    last 4 hours (i.e. genuinely new filings). Old backlog documents are extracted
+    silently without triggering report generation.
     """
     from src.config.company_registry import get_company_config
     from src.models.database import get_active_companies
     from src.parsers.universal_document_processor import process_document
     from src.services.supabase_client import get_supabase_client
-    from datetime import date as date_cls
+    from datetime import date as date_cls, datetime as datetime_cls, timezone
 
     client = get_supabase_client()
 
     pending = (
         client.table("reit_company_documents")
-        .select("id, company_id, source_url, document_type, document_date, title")
+        .select("id, company_id, source_url, document_type, document_date, title, created_at")
         .eq("status", "detected")
         .is_("raw_content", "null")
         .order("document_date", desc=True)
@@ -555,7 +556,10 @@ async def process_detected_backlog():
     logger.info("Extraction backlog: processing %d detected document(s)", len(pending))
 
     companies = {c["id"]: c for c in get_active_companies()}
-    extracted_company_ids: set[str] = set()
+    # company_id → True if the extracted doc was recently detected (new filing)
+    new_extraction_companies: dict[str, dict] = {}
+
+    now_utc = datetime_cls.now(timezone.utc)
 
     for doc in pending:
         company_id = doc["company_id"]
@@ -576,6 +580,17 @@ async def process_detected_backlog():
             date_cls.fromisoformat(raw_date[:10]) if raw_date else date_cls.today()
         )
 
+        # Determine if this is a new filing (detected within the last 4 hours)
+        is_new = False
+        raw_created = doc.get("created_at")
+        if raw_created:
+            try:
+                created_at = datetime_cls.fromisoformat(raw_created.replace("Z", "+00:00"))
+                age_hours = (now_utc - created_at).total_seconds() / 3600
+                is_new = age_hours <= 4
+            except Exception:
+                pass
+
         try:
             ok = await process_document(
                 company_id=company_id,
@@ -590,18 +605,22 @@ async def process_detected_backlog():
                 skip_email=True,
             )
             if ok:
-                extracted_company_ids.add(company_id)
-                logger.info("Extracted: %s %s (%s)", ticker, doc["document_type"], doc["source_url"][:80])
+                logger.info(
+                    "Extracted: %s %s (%s)%s",
+                    ticker, doc["document_type"], doc["source_url"][:80],
+                    " [new — will generate report]" if is_new else "",
+                )
+                if is_new and settings.summary_enabled:
+                    new_extraction_companies[company_id] = co
         except Exception as e:
             logger.error("Backlog extraction failed for %s %s: %s", ticker, doc["source_url"][:80], e)
 
-    # After extraction, check if summaries should be generated
-    if extracted_company_ids and settings.summary_enabled:
+    # Generate reports for newly detected documents only
+    if new_extraction_companies:
         import asyncio
-        for company_id in extracted_company_ids:
-            co = companies.get(company_id)
-            if co:
-                asyncio.create_task(_maybe_generate_summary(company_id, co["name"], co["ticker"]))
+        for company_id, co in new_extraction_companies.items():
+            asyncio.create_task(_maybe_generate_summary(company_id, co["name"], co["ticker"]))
+
 
 
 async def _maybe_generate_summary(company_id: str, company_name: str, ticker: str):
