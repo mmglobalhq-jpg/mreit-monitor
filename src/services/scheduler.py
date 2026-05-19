@@ -14,6 +14,7 @@ from datetime import date as date_cls
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from src.config.settings import settings
 from src.config.filing_calendar import (
@@ -30,10 +31,13 @@ async def poll_ir_pages_only():
     Hourly job: scrape IR pages only — no EDGAR.
     Free since the switch to BS4 tier 1 / Qwen3 fallback.
     Skips if the filing calendar says no companies are due today.
+    Sources are loaded from reit_company_sources (active=true, source_type=website).
     """
     from src.config.company_registry import get_company_config
+    from src.config.source_loader import load_active_website_sources, DBScrapeSource
+    from src.config.company_registry import ScrapeSource
     from src.models.database import get_active_companies, log_poll
-    from src.services.universal_scraper import scrape_company_universal, filter_new_documents
+    from src.services.universal_scraper import scrape_ir_page, filter_new_documents
     from src.parsers.universal_document_processor import store_detected_document
 
     today = date_cls.today()
@@ -61,8 +65,24 @@ async def poll_ir_pages_only():
             logger.warning("No config for %s — skipping", ticker)
             continue
 
+        # Load active website sources from DB instead of hardcoded registry
+        db_sources = load_active_website_sources(ticker)
+        if not db_sources:
+            logger.info("No active website sources in DB for %s — skipping IR scrape", ticker)
+            log_poll(company_id, "universal_scrape", ticker, new_filings=0)
+            continue
+
         try:
-            universal_docs = await scrape_company_universal(registry_config, ticker)
+            all_docs = []
+            for db_src in db_sources:
+                scrape_source = ScrapeSource(
+                    type="website",
+                    url=db_src.url,
+                    doc_type=db_src.doc_type,
+                )
+                docs = await scrape_ir_page(scrape_source, registry_config, ticker)
+                all_docs.extend(docs)
+            universal_docs = all_docs
             new_docs = await filter_new_documents(universal_docs, company_id)
             total_new += len(new_docs)
 
@@ -502,6 +522,109 @@ async def generate_scheduled_summaries():
             logger.error("Failed to generate summary for %s: %s", ticker, e)
 
 
+async def process_detected_backlog():
+    """
+    Every-15-min job: pick up to 5 documents stuck at status='detected' and run
+    the full download → extract pipeline on each.
+
+    After each successful extraction, checks whether a summary report should be
+    generated for that company and fires one in the background if so.
+    """
+    from src.config.company_registry import get_company_config
+    from src.models.database import get_active_companies
+    from src.parsers.universal_document_processor import process_document
+    from src.services.supabase_client import get_supabase_client
+    from datetime import date as date_cls
+
+    client = get_supabase_client()
+
+    pending = (
+        client.table("reit_company_documents")
+        .select("id, company_id, source_url, document_type, document_date, title")
+        .eq("status", "detected")
+        .is_("raw_content", "null")
+        .order("document_date", desc=True)
+        .limit(5)
+        .execute()
+    ).data
+
+    if not pending:
+        logger.debug("Extraction backlog: nothing to process")
+        return
+
+    logger.info("Extraction backlog: processing %d detected document(s)", len(pending))
+
+    companies = {c["id"]: c for c in get_active_companies()}
+    extracted_company_ids: set[str] = set()
+
+    for doc in pending:
+        company_id = doc["company_id"]
+        co = companies.get(company_id)
+        if not co:
+            logger.warning("Unknown company_id %s on document %s — skipping", company_id, doc["id"])
+            continue
+
+        ticker = co["ticker"]
+        company_name = co["name"]
+        registry_config = get_company_config(ticker)
+        if not registry_config:
+            logger.warning("No registry config for %s — skipping extraction", ticker)
+            continue
+
+        raw_date = doc.get("document_date")
+        document_date = (
+            date_cls.fromisoformat(raw_date[:10]) if raw_date else date_cls.today()
+        )
+
+        try:
+            ok = await process_document(
+                company_id=company_id,
+                company_name=company_name,
+                ticker=ticker,
+                company_config=registry_config,
+                source_url=doc["source_url"],
+                document_type=doc["document_type"],
+                document_date=document_date,
+                period_label="",
+                title=doc.get("title", ""),
+                skip_email=True,
+            )
+            if ok:
+                extracted_company_ids.add(company_id)
+                logger.info("Extracted: %s %s (%s)", ticker, doc["document_type"], doc["source_url"][:80])
+        except Exception as e:
+            logger.error("Backlog extraction failed for %s %s: %s", ticker, doc["source_url"][:80], e)
+
+    # After extraction, check if summaries should be generated
+    if extracted_company_ids and settings.summary_enabled:
+        import asyncio
+        for company_id in extracted_company_ids:
+            co = companies.get(company_id)
+            if co:
+                asyncio.create_task(_maybe_generate_summary(company_id, co["name"], co["ticker"]))
+
+
+async def _maybe_generate_summary(company_id: str, company_name: str, ticker: str):
+    """Fire summary generation for a company if warranted by recent extraction."""
+    from datetime import date as date_cls
+    from src.services.summary_service import generate_monthly_summary
+
+    today = date_cls.today()
+    # For companies with monthly updates (ARR), generate for the most recent month
+    # with a new extraction but no summary yet
+    MONTHLY_TICKERS = {"ARR"}
+    if ticker not in MONTHLY_TICKERS:
+        return
+
+    try:
+        month = today.month - 1 if today.month > 1 else 12
+        year = today.year if today.month > 1 else today.year - 1
+        logger.info("Auto-generating monthly summary for %s %d-%02d after extraction", ticker, year, month)
+        await generate_monthly_summary(company_id, company_name, ticker, year, month)
+    except Exception as e:
+        logger.error("Auto summary generation failed for %s: %s", ticker, e)
+
+
 async def send_new_filing_notification(total_new: int, filing_details: list[dict]):
     """
     Send an email to the admin when new filings are detected during the daily poll.
@@ -586,6 +709,25 @@ def start_scheduler() -> AsyncIOScheduler:
         ),
         id="daily_edgar",
         name="Daily EDGAR filing check",
+        replace_existing=True,
+    )
+
+    # Every 15 min: process documents stuck at status='detected'
+    scheduler.add_job(
+        process_detected_backlog,
+        IntervalTrigger(minutes=15),
+        id="extraction_backlog",
+        name="Process detected document backlog",
+        replace_existing=True,
+        misfire_grace_time=120,
+    )
+
+    # Daily at 8:30 AM ET: generate scheduled summaries (monthly/quarterly/annual)
+    scheduler.add_job(
+        generate_scheduled_summaries,
+        CronTrigger(hour=8, minute=30, timezone="US/Eastern"),
+        id="daily_summary_check",
+        name="Daily summary generation check",
         replace_existing=True,
     )
 

@@ -36,7 +36,7 @@ def _get_available_periods() -> dict:
     from src.services.supabase_client import get_supabase_client
 
     client = get_supabase_client()
-    companies = client.table("companies").select("id, ticker, name").eq("is_active", True).execute().data
+    companies = client.table("reit_companies").select("id, ticker, name").eq("is_active", True).execute().data
     co_map = {co["id"]: co for co in companies}
 
     result = {}
@@ -46,7 +46,7 @@ def _get_available_periods() -> dict:
         result[ticker] = {"name": co["name"], "monthly": [], "quarterly": [], "annual": []}
 
     # Monthly: from monthly_metrics (ARR) or universal_extractions with monthly types
-    monthly_rows = client.table("monthly_metrics").select("company_id, as_of_date").order("as_of_date", desc=True).execute().data
+    monthly_rows = client.table("reit_monthly_metrics").select("company_id, as_of_date").order("as_of_date", desc=True).execute().data
     seen_monthly = set()
     for row in monthly_rows:
         co = co_map.get(row["company_id"])
@@ -74,7 +74,7 @@ def _get_available_periods() -> dict:
             })
 
     # Quarterly: from quarterly_metrics + universal_extractions
-    quarterly_rows = client.table("quarterly_metrics").select("company_id, period_end_date, quarter_label").order("period_end_date", desc=True).execute().data
+    quarterly_rows = client.table("reit_quarterly_metrics").select("company_id, period_end_date, quarter_label").order("period_end_date", desc=True).execute().data
     seen_quarterly = set()
     for row in quarterly_rows:
         co = co_map.get(row["company_id"])
@@ -96,7 +96,7 @@ def _get_available_periods() -> dict:
                 })
 
     # Also check universal_extractions for quarterly data (new companies)
-    ue_rows = client.table("universal_extractions").select("company_id, fiscal_year, fiscal_quarter, period_end").order("period_end", desc=True).execute().data
+    ue_rows = client.table("reit_universal_extractions").select("company_id, fiscal_year, fiscal_quarter, period_end").order("period_end", desc=True).execute().data
     for row in ue_rows:
         co = co_map.get(row["company_id"])
         if not co:
@@ -376,7 +376,7 @@ async def list_reports():
 
     client = get_supabase_client()
     result = (
-        client.table("summary_reports")
+        client.table("reit_summary_reports")
         .select("id, company_id, report_type, period_label, model_used, tokens_used, email_sent, email_sent_at, created_at, report_json")
         .order("created_at", desc=True)
         .limit(50)
@@ -384,7 +384,7 @@ async def list_reports():
     )
 
     # Map company_ids to tickers
-    companies = client.table("companies").select("id, ticker").execute().data
+    companies = client.table("reit_companies").select("id, ticker").execute().data
     co_map = {co["id"]: co["ticker"] for co in companies}
 
     report_rows = ""
@@ -417,7 +417,7 @@ async def list_reports():
 
     # Build pending filings section
     pending_docs = (
-        client.table("company_documents")
+        client.table("reit_company_documents")
         .select("id, company_id, document_type, source_url, title, document_date, created_at")
         .eq("status", "detected")
         .order("created_at", desc=True)
@@ -488,7 +488,7 @@ async def view_report(report_id: str):
 
     client = get_supabase_client()
     result = (
-        client.table("summary_reports")
+        client.table("reit_summary_reports")
         .select("*")
         .eq("id", report_id)
         .limit(1)
@@ -563,7 +563,7 @@ async def send_report_email(report_id: str):
 
     client = get_supabase_client()
     result = (
-        client.table("summary_reports")
+        client.table("reit_summary_reports")
         .select("*")
         .eq("id", report_id)
         .limit(1)
@@ -625,7 +625,7 @@ async def send_report_email(report_id: str):
         raise HTTPException(status_code=500, detail=f"Email send failed: {e}")
 
     # Mark as sent
-    client.table("summary_reports").update({
+    client.table("reit_summary_reports").update({
         "email_sent": True,
         "email_sent_at": datetime.utcnow().isoformat(),
     }).eq("id", report_id).execute()
@@ -653,7 +653,7 @@ async def process_pending_filings(ticker: str):
 
     client = get_supabase_client()
     pending = (
-        client.table("company_documents")
+        client.table("reit_company_documents")
         .select("*")
         .eq("company_id", company["id"])
         .eq("status", "detected")
@@ -829,11 +829,11 @@ async def ab_test_page():
     from src.services.supabase_client import get_supabase_client
 
     client = get_supabase_client()
-    companies = client.table("companies").select("id, ticker").execute().data
+    companies = client.table("reit_companies").select("id, ticker").execute().data
     co_map = {co["id"]: co["ticker"] for co in companies}
 
     docs = (
-        client.table("company_documents")
+        client.table("reit_company_documents")
         .select("id, company_id, document_type, title, document_date, source_url")
         .eq("status", "completed")
         .order("document_date", desc=True)
@@ -870,12 +870,12 @@ async def run_ab_test(
 
     client = get_supabase_client()
 
-    doc = client.table("company_documents").select("*").eq("id", document_id).limit(1).execute().data
+    doc = client.table("reit_company_documents").select("*").eq("id", document_id).limit(1).execute().data
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     doc = doc[0]
 
-    company = client.table("companies").select("*").eq("id", doc["company_id"]).limit(1).execute().data
+    company = client.table("reit_companies").select("*").eq("id", doc["company_id"]).limit(1).execute().data
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
     company = company[0]
@@ -885,7 +885,7 @@ async def run_ab_test(
     if not config:
         raise HTTPException(status_code=400, detail=f"No config for {ticker}")
 
-    companies_list = client.table("companies").select("id, ticker").execute().data
+    companies_list = client.table("reit_companies").select("id, ticker").execute().data
     co_map = {co["id"]: co["ticker"] for co in companies_list}
 
     # Get document content
@@ -910,7 +910,7 @@ async def run_ab_test(
 
     # Get baseline extraction for comparison
     baseline_ext = (
-        client.table("universal_extractions")
+        client.table("reit_universal_extractions")
         .select("*")
         .eq("document_id", document_id)
         .limit(1)
@@ -948,7 +948,7 @@ async def run_ab_test(
 
             # Store comparison result
             try:
-                client.table("extraction_comparisons").insert({
+                client.table("reit_extraction_comparisons").insert({
                     "document_id": document_id,
                     "model_name": model,
                     "extraction_data": extraction.model_dump(mode="json"),
@@ -1032,7 +1032,7 @@ async def run_ab_test(
 
     # Rebuild page with results
     docs_list = (
-        client.table("company_documents")
+        client.table("reit_company_documents")
         .select("id, company_id, document_type, title, document_date, source_url")
         .eq("status", "completed")
         .order("document_date", desc=True)

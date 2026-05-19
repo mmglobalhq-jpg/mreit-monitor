@@ -83,6 +83,7 @@ async def generate_summary_report(
         prior_quarterly_metrics_json=json.dumps(data_context.get("prior_quarterly_metrics", []), indent=2, default=str),
         universal_extractions_json=json.dumps(data_context.get("universal_extractions", []), indent=2, default=str),
         prior_universal_extractions_json=json.dumps(data_context.get("prior_universal_extractions", []), indent=2, default=str),
+        source_documents_json=json.dumps(data_context.get("source_documents", []), indent=2, default=str),
         schema_json=schema_json,
     )
 

@@ -203,7 +203,7 @@ async def scrape_ir_page(
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=30.0,
-            headers={"User-Agent": "mREIT-Monitor/1.0"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"},
         ) as client:
             response = await client.get(source.url)
             response.raise_for_status()
@@ -297,7 +297,7 @@ async def filter_new_documents(
     urls = [d.source_url for d in detected]
 
     existing = (
-        client.table("company_documents")
+        client.table("reit_company_documents")
         .select("source_url")
         .eq("company_id", company_id)
         .in_("source_url", urls)

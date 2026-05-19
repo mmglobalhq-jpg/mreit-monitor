@@ -215,11 +215,26 @@ async def store_universal_extraction(
         "extraction_confidence": extraction.extraction_confidence,
     }
 
-    result = (
-        client.table("universal_extractions")
-        .upsert(row, on_conflict="document_id")
+    existing = (
+        client.table("reit_universal_extractions")
+        .select("id")
+        .eq("document_id", document_id)
+        .limit(1)
         .execute()
     )
+    if existing.data:
+        result = (
+            client.table("reit_universal_extractions")
+            .update(row)
+            .eq("document_id", document_id)
+            .execute()
+        )
+    else:
+        result = (
+            client.table("reit_universal_extractions")
+            .insert(row)
+            .execute()
+        )
 
     logger.info(
         "Stored universal extraction for document %s (company %s)",

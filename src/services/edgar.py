@@ -6,6 +6,7 @@ No authentication required — just a User-Agent header with contact info.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -16,9 +17,13 @@ from src.config.settings import settings
 logger = logging.getLogger("mreit-monitor.edgar")
 
 EDGAR_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+EDGAR_INDEX_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/{accession_with_dashes}-index.htm"
 
 # Form types we care about
 RELEVANT_FORM_TYPES = {"8-K", "10-Q", "10-K", "10-K/A", "10-Q/A"}
+
+# Exhibit types we want to ingest (exclude XBRL schema/label/def/pre, graphics, full text)
+INGEST_EXHIBIT_TYPES = {"EX-99.1", "EX-99.2", "EX-99.3"}
 
 
 @dataclass
@@ -30,6 +35,101 @@ class EdgarFiling:
     primary_document: str
     primary_document_url: str
     description: str
+
+
+@dataclass
+class ExhibitInfo:
+    """An exhibit attachment found in an EDGAR filing index."""
+    sequence: int
+    description: str
+    filename: str
+    file_type: str   # e.g. "EX-99.1", "EX-101.SCH", "GRAPHIC"
+    url: str
+    size_bytes: int
+
+
+async def get_filing_exhibits(accession_number: str, cik: str) -> list[ExhibitInfo]:
+    """
+    Fetch the EDGAR filing index page and return all document attachments.
+
+    Args:
+        accession_number: With dashes, e.g. '0001428205-26-000068'
+        cik: CIK with leading zeros, e.g. '0001428205'
+
+    Returns:
+        List of ExhibitInfo for every document row in the filing index table.
+    """
+    cik_no_pad = cik.lstrip("0")
+    accession_no_dashes = accession_number.replace("-", "")
+    index_url = EDGAR_INDEX_URL.format(
+        cik=cik_no_pad,
+        accession_no_dashes=accession_no_dashes,
+        accession_with_dashes=accession_number,
+    )
+
+    headers = {"User-Agent": settings.edgar_user_agent}
+    logger.info("Fetching EDGAR filing index: %s", index_url)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(index_url, headers=headers)
+        resp.raise_for_status()
+
+    html = resp.text
+    exhibits: list[ExhibitInfo] = []
+
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.DOTALL):
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
+        if len(cells) < 4:
+            continue
+
+        seq_text = re.sub(r"<[^>]+>", "", cells[0]).strip()
+        if not seq_text.isdigit():
+            continue
+
+        description = re.sub(r"<[^>]+>", "", cells[1]).strip()
+
+        href_match = re.search(r'href="([^"]+)"', cells[2])
+        if not href_match:
+            continue
+        href = href_match.group(1)
+        if href.startswith("/ix?doc="):
+            href = href[len("/ix?doc="):]
+        full_url = f"https://www.sec.gov{href}" if href.startswith("/") else href
+
+        file_type = re.sub(r"<[^>]+>", "", cells[3]).strip()
+        size_text = re.sub(r"<[^>]+>", "", cells[4]).strip() if len(cells) > 4 else "0"
+
+        exhibits.append(ExhibitInfo(
+            sequence=int(seq_text),
+            description=description,
+            filename=full_url.split("/")[-1],
+            file_type=file_type,
+            url=full_url,
+            size_bytes=int(size_text) if size_text.isdigit() else 0,
+        ))
+
+    logger.info("Found %d documents in filing index %s", len(exhibits), accession_number)
+    return exhibits
+
+
+def accession_from_edgar_url(source_url: str) -> tuple[str, str] | None:
+    """
+    Parse CIK and accession_number (with dashes) from an EDGAR Archives URL.
+
+    URL pattern: https://www.sec.gov/Archives/edgar/data/{cik}/{accno_nodash}/{file}
+    Returns (cik_padded_10, accession_with_dashes) or None if not parseable.
+    """
+    match = re.match(
+        r"https://www\.sec\.gov/Archives/edgar/data/(\d+)/(\d{18})/",
+        source_url,
+    )
+    if not match:
+        return None
+    cik_raw = match.group(1)
+    accno_nodash = match.group(2)
+    cik_padded = cik_raw.zfill(10)
+    accession = f"{accno_nodash[:10]}-{accno_nodash[10:12]}-{accno_nodash[12:]}"
+    return cik_padded, accession
 
 
 async def check_new_filings(

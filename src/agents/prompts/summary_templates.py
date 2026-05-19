@@ -166,6 +166,11 @@ UNIVERSAL EXTRACTIONS (normalized data from all document types):
 PRIOR PERIOD UNIVERSAL EXTRACTIONS:
 {prior_universal_extractions_json}
 
+SOURCE DOCUMENTS (raw text extracted directly from the company's filings for this period):
+{source_documents_json}
+
+These source documents are your primary input. Read them carefully and extract the actual numbers, coupon tables, repo terms, leverage figures, and management language directly from the text. The structured metrics sections above are cross-validation only — if they are empty, build the entire report from the source documents. Never say "data unavailable" if source documents are present.
+
 Produce a summary report matching this JSON schema:
 {schema_json}
 

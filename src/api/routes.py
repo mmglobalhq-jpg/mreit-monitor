@@ -101,10 +101,41 @@ async def trigger_poll(ticker: str):
         except Exception as e:
             logger.error("Failed to store detected %s: %s", doc.period_label, e)
 
+    # EDGAR fallback: check SEC EDGAR for recent filings when the CIK is known
+    edgar_new = 0
+    if registry_config.cik:
+        try:
+            from datetime import date as date_cls, timedelta
+            from src.services.edgar import check_new_filings as check_edgar_filings
+
+            since = date_cls.today() - timedelta(days=30)
+            edgar_filings = await check_edgar_filings(registry_config.cik, since_date=since)
+
+            _EDGAR_DOC_TYPE = {"10-Q": "quarterly_earnings", "10-K": "annual_10k", "8-K": "sec_filing"}
+            for ef in edgar_filings:
+                doc_type = _EDGAR_DOC_TYPE.get(ef.form_type, "sec_filing")
+                period_label = f"{ef.form_type} {ef.filing_date.isoformat()}"
+                try:
+                    store_detected_document(
+                        company_id=company["id"],
+                        ticker=company["ticker"],
+                        source_url=ef.primary_document_url,
+                        document_type=doc_type,
+                        document_date=ef.filing_date,
+                        title=f"{ticker.upper()} {period_label}",
+                        period_label=period_label,
+                    )
+                    edgar_new += 1
+                except Exception as e:
+                    logger.error("Failed to store EDGAR filing %s: %s", ef.accession_number, e)
+        except Exception as e:
+            logger.warning("EDGAR check failed for %s: %s", ticker.upper(), e)
+
+    total_new = len(new_docs) + edgar_new
     return TriggerResponse(
         status="ok",
-        message=f"Poll complete. {len(detected)} detected, {len(new_docs)} new (stored as pending).",
-        filings_found=len(new_docs),
+        message=f"Poll complete. {len(detected)} website detected, {len(new_docs)} new; {edgar_new} new EDGAR filings. {total_new} total stored.",
+        filings_found=total_new,
     )
 
 
@@ -180,6 +211,83 @@ async def trigger_extract(request: ExtractRequest):
         status="ok" if success else "error",
         message=f"Extraction {'completed' if success else 'failed'} for {request.source_url}",
         filings_found=1 if success else 0,
+    )
+
+
+@router.post("/trigger/discover-exhibits/{document_id}", response_model=TriggerResponse, dependencies=[Depends(require_api_key)])
+async def discover_exhibits(document_id: str):
+    """
+    Discover EX-99.* exhibit attachments for an EDGAR 8-K document row.
+
+    Fetches the EDGAR filing index, finds all EX-99.1/99.2/99.3 entries,
+    and creates detected child rows in reit_company_documents linked by title
+    to the parent 8-K document. Does not download or extract content.
+    """
+    from src.services.edgar import get_filing_exhibits, accession_from_edgar_url, INGEST_EXHIBIT_TYPES
+    from src.parsers.universal_document_processor import store_detected_document
+    from src.services.supabase_client import get_supabase_client
+    from datetime import date as date_cls
+
+    client = get_supabase_client()
+
+    parent_result = client.table("reit_company_documents").select(
+        "id, company_id, source_url, document_type, document_date, title"
+    ).eq("id", document_id).limit(1).execute()
+
+    if not parent_result.data:
+        raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
+
+    parent = parent_result.data[0]
+    source_url = parent["source_url"]
+
+    parsed = accession_from_edgar_url(source_url)
+    if not parsed:
+        raise HTTPException(status_code=400, detail=f"Not a recognised EDGAR Archives URL: {source_url}")
+
+    cik_padded, accession = parsed
+
+    company_result = client.table("reit_companies").select("ticker").eq("id", parent["company_id"]).limit(1).execute()
+    if not company_result.data:
+        raise HTTPException(status_code=404, detail="Parent company not found")
+    ticker = company_result.data[0]["ticker"]
+
+    all_exhibits = await get_filing_exhibits(accession, cik_padded)
+    target_exhibits = [ex for ex in all_exhibits if ex.file_type in INGEST_EXHIBIT_TYPES]
+
+    raw_date = parent.get("document_date")
+    if isinstance(raw_date, str):
+        try:
+            doc_date = date_cls.fromisoformat(raw_date[:10])
+        except ValueError:
+            doc_date = date_cls.today()
+    elif isinstance(raw_date, date_cls):
+        doc_date = raw_date
+    else:
+        doc_date = date_cls.today()
+
+    created = []
+    for exhibit in target_exhibits:
+        doc_type = "monthly_update"
+        title = f"{ticker} {exhibit.file_type} {doc_date.isoformat()} [parent:{document_id[:8]}]"
+        try:
+            store_detected_document(
+                company_id=parent["company_id"],
+                ticker=ticker,
+                source_url=exhibit.url,
+                document_type=doc_type,
+                document_date=doc_date,
+                title=title,
+                period_label=f"{exhibit.file_type} {doc_date.isoformat()}",
+            )
+            created.append({"file_type": exhibit.file_type, "filename": exhibit.filename, "url": exhibit.url, "size": exhibit.size_bytes})
+            logger.info("Created exhibit document: %s %s -> %s", ticker, exhibit.file_type, exhibit.filename)
+        except Exception as e:
+            logger.error("Failed to store exhibit %s: %s", exhibit.filename, e)
+
+    return TriggerResponse(
+        status="ok",
+        message=f"Discovered {len(all_exhibits)} total docs, created {len(created)} EX-99 exhibit rows for {ticker}: {[c['filename'] for c in created]}",
+        filings_found=len(created),
     )
 
 
@@ -281,7 +389,7 @@ async def list_filings(ticker: str, filing_type: str | None = None, limit: int =
 
     client = get_supabase_client()
     query = (
-        client.table("filings")
+        client.table("reit_filings")
         .select("filing_type, period_label, status, filing_date, completed_at")
         .eq("company_id", company["id"])
         .order("filing_date", desc=True)
@@ -445,7 +553,7 @@ async def get_latest_summary(ticker: str):
 
     client = get_supabase_client()
     result = (
-        client.table("summary_reports")
+        client.table("reit_summary_reports")
         .select("*")
         .eq("company_id", company["id"])
         .order("created_at", desc=True)

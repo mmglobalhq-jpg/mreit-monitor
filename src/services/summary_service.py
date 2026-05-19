@@ -34,7 +34,7 @@ def _gather_period_data(
 
     # Monthly metrics
     monthly_data = (
-        client.table("monthly_metrics")
+        client.table("reit_monthly_metrics")
         .select("*")
         .eq("company_id", company_id)
         .gte("as_of_date", start_str)
@@ -45,7 +45,7 @@ def _gather_period_data(
 
     # Quarterly metrics
     quarterly_data = (
-        client.table("quarterly_metrics")
+        client.table("reit_quarterly_metrics")
         .select("*")
         .eq("company_id", company_id)
         .gte("period_end_date", start_str)
@@ -56,7 +56,7 @@ def _gather_period_data(
 
     # Agent analyses from this period
     analyses = (
-        client.table("agent_analyses")
+        client.table("reit_agent_analyses")
         .select("*")
         .eq("company_id", company_id)
         .gte("created_at", start_str)
@@ -67,7 +67,7 @@ def _gather_period_data(
 
     # Portfolio positions — get filing IDs for the period first
     filings_in_period = (
-        client.table("filings")
+        client.table("reit_filings")
         .select("id")
         .eq("company_id", company_id)
         .gte("filing_date", start_str)
@@ -79,7 +79,7 @@ def _gather_period_data(
     portfolio_data = []
     if filing_ids:
         portfolio_data = (
-            client.table("portfolio_positions")
+            client.table("reit_portfolio_positions")
             .select("*")
             .in_("filing_id", filing_ids)
             .execute()
@@ -87,7 +87,7 @@ def _gather_period_data(
 
     # CPR data
     cpr_data = (
-        client.table("cpr_data")
+        client.table("reit_cpr_data")
         .select("*")
         .eq("company_id", company_id)
         .gte("month", start_str)
@@ -99,6 +99,9 @@ def _gather_period_data(
     # Universal extractions (multi-company pipeline)
     universal_data = _gather_universal_data(company_id, start_date, end_date)
 
+    # Raw source documents — primary context when structured tables are empty
+    source_documents = _get_source_documents(company_id, start_date, end_date)
+
     return {
         "monthly_data": monthly_data,
         "quarterly_data": quarterly_data,
@@ -106,7 +109,52 @@ def _gather_period_data(
         "portfolio_data": portfolio_data,
         "cpr_data": cpr_data,
         "universal_extractions": universal_data,
+        "source_documents": source_documents,
     }
+
+
+def _get_source_documents(
+    company_id: str,
+    start_date: date,
+    end_date: date,
+) -> list[dict]:
+    """
+    Fetch raw document text for the period from reit_company_documents.
+
+    Uses a ±45-day window around the stated period to capture monthly updates
+    that are published after month-end. Returns up to 5 documents with their
+    raw_content truncated to 12,000 chars each to stay within LLM context budget.
+    """
+    client = get_supabase_client()
+
+    # Expand window to catch documents published around period boundaries
+    window_start = (start_date - timedelta(days=45)).isoformat()
+    window_end = (end_date + timedelta(days=45)).isoformat()
+
+    rows = (
+        client.table("reit_company_documents")
+        .select("id, document_type, document_date, title, source_url, raw_content, status")
+        .eq("company_id", company_id)
+        .not_.is_("raw_content", "null")
+        .gte("document_date", window_start)
+        .lte("document_date", window_end)
+        .order("document_date", desc=True)
+        .limit(5)
+        .execute()
+    ).data
+
+    result = []
+    for row in rows:
+        content = row.get("raw_content") or ""
+        result.append({
+            "document_type": row.get("document_type"),
+            "document_date": row.get("document_date"),
+            "title": row.get("title"),
+            "source_url": row.get("source_url"),
+            "raw_content": content[:12000] + ("…[truncated]" if len(content) > 12000 else ""),
+        })
+
+    return result
 
 
 def _gather_universal_data(
@@ -123,18 +171,36 @@ def _gather_universal_data(
     end_str = end_date.isoformat()
 
     try:
-        result = (
-            client.table("universal_extractions")
-            .select("*, company_documents(document_type, document_date, title, source_url)")
+        extractions = (
+            client.table("reit_universal_extractions")
+            .select("*")
             .eq("company_id", company_id)
             .gte("period_end", start_str)
             .lte("period_end", end_str)
             .order("period_end", desc=False)
             .execute()
-        )
-        return result.data
-    except Exception:
-        # Table may not exist yet during transition
+        ).data
+
+        if not extractions:
+            return []
+
+        doc_ids = [e["document_id"] for e in extractions if e.get("document_id")]
+        doc_meta: dict = {}
+        if doc_ids:
+            docs = (
+                client.table("reit_company_documents")
+                .select("id, document_type, document_date, title, source_url")
+                .in_("id", doc_ids)
+                .execute()
+            ).data
+            doc_meta = {d["id"]: d for d in docs}
+
+        for e in extractions:
+            e["reit_company_documents"] = doc_meta.get(e.get("document_id"), {})
+
+        return extractions
+    except Exception as exc:
+        logger.warning("_gather_universal_data failed: %s", exc)
         return []
 
 
@@ -168,7 +234,7 @@ def _gather_prior_period_data(
 
     # Prior monthly metrics
     prior_monthly = (
-        client.table("monthly_metrics")
+        client.table("reit_monthly_metrics")
         .select("*")
         .eq("company_id", company_id)
         .gte("as_of_date", lookback_str)
@@ -181,7 +247,7 @@ def _gather_prior_period_data(
     # Prior quarterly metrics
     quarterly_limit = 1 if report_type == "monthly" else 4
     prior_quarterly = (
-        client.table("quarterly_metrics")
+        client.table("reit_quarterly_metrics")
         .select("*")
         .eq("company_id", company_id)
         .gte("period_end_date", lookback_str)
@@ -193,7 +259,7 @@ def _gather_prior_period_data(
 
     # Prior portfolio positions — get filing IDs for monthly_update filings before the period
     prior_filings = (
-        client.table("filings")
+        client.table("reit_filings")
         .select("id, filing_date")
         .eq("company_id", company_id)
         .eq("filing_type", "monthly_update")
@@ -209,7 +275,7 @@ def _gather_prior_period_data(
     prior_positions = {}
     if prior_filing_ids:
         all_positions = (
-            client.table("portfolio_positions")
+            client.table("reit_portfolio_positions")
             .select("*")
             .in_("filing_id", prior_filing_ids)
             .execute()
@@ -255,13 +321,26 @@ def _store_summary_report(
         "report_json": report_json,
         "model_used": model_used,
         "tokens_used": tokens_used,
+        "email_sent": False,
+        "source_project": "tom_core",
     }
 
-    result = (
-        client.table("summary_reports")
-        .upsert(row, on_conflict="company_id,report_type,period_start")
+    existing = (
+        client.table("reit_summary_reports")
+        .select("id")
+        .eq("company_id", company_id)
+        .eq("report_type", report_type)
+        .eq("period_start", period_start.isoformat())
+        .limit(1)
         .execute()
     )
+    if existing.data:
+        report_id = existing.data[0]["id"]
+        client.table("reit_summary_reports").update(row).eq("id", report_id).execute()
+        row["id"] = report_id
+        return row
+
+    result = client.table("reit_summary_reports").insert(row).execute()
     return result.data[0] if result.data else row
 
 
@@ -460,7 +539,7 @@ async def analyze_material(
     client = get_supabase_client()
 
     result = (
-        client.table("investor_materials")
+        client.table("reit_investor_materials")
         .select("*")
         .eq("id", document_id)
         .limit(1)
@@ -484,7 +563,7 @@ async def analyze_material(
 
     from datetime import datetime
 
-    client.table("investor_materials").update({
+    client.table("reit_investor_materials").update({
         "analysis_json": analysis.model_dump(),
         "analyzed_at": datetime.utcnow().isoformat(),
     }).eq("id", document_id).execute()

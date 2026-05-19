@@ -37,6 +37,19 @@ def store_detected_document(
     so the user can review and approve processing from the Review page.
     """
     client = get_supabase_client()
+    existing = (
+        client.table("reit_company_documents")
+        .select("id")
+        .eq("company_id", company_id)
+        .eq("document_type", document_type)
+        .eq("source_url", source_url)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        logger.debug("Document already exists, skipping: %s %s", ticker, source_url[:80])
+        return
+
     row = {
         "company_id": company_id,
         "document_type": document_type,
@@ -47,9 +60,7 @@ def store_detected_document(
     }
     if period_label:
         row["period_end"] = None  # will be set during processing
-    client.table("company_documents").upsert(
-        row, on_conflict="company_id,document_type,source_url"
-    ).execute()
+    client.table("reit_company_documents").insert(row).execute()
     logger.info("Stored detected document: %s %s (%s)", ticker, document_type, source_url[:80])
 
 
@@ -133,12 +144,21 @@ async def process_document(
             doc_row["period_end"] = f"{document_date.year}-12-31"
 
     try:
-        result = (
-            client.table("company_documents")
-            .upsert(doc_row, on_conflict="company_id,document_type,source_url")
+        existing = (
+            client.table("reit_company_documents")
+            .select("id")
+            .eq("company_id", company_id)
+            .eq("document_type", document_type)
+            .eq("source_url", source_url)
+            .limit(1)
             .execute()
         )
-        document_id = result.data[0]["id"] if result.data else None
+        if existing.data:
+            document_id = existing.data[0]["id"]
+            client.table("reit_company_documents").update(doc_row).eq("id", document_id).execute()
+        else:
+            result = client.table("reit_company_documents").insert(doc_row).execute()
+            document_id = result.data[0]["id"] if result.data else None
     except Exception as e:
         logger.error("Failed to store document record: %s", e)
         return False
@@ -156,14 +176,14 @@ async def process_document(
                 response.content,
                 {"content-type": "application/pdf"},
             )
-            client.table("company_documents").update({"file_path": storage_path}).eq("id", document_id).execute()
+            client.table("reit_company_documents").update({"file_path": storage_path}).eq("id", document_id).execute()
             logger.info("Uploaded PDF to storage: %s", storage_path)
         except Exception as e:
             logger.warning("Storage upload failed (continuing): %s", e)
 
     # Step 4: Run universal extraction
     try:
-        client.table("company_documents").update({"status": "extracting"}).eq("id", document_id).execute()
+        client.table("reit_company_documents").update({"status": "extracting"}).eq("id", document_id).execute()
 
         extraction, metadata = await extract_document(
             content=raw_content,
@@ -176,7 +196,7 @@ async def process_document(
         # Step 5: Store extraction
         await store_universal_extraction(extraction, document_id, company_id)
 
-        client.table("company_documents").update({"status": "extracted"}).eq("id", document_id).execute()
+        client.table("reit_company_documents").update({"status": "extracted"}).eq("id", document_id).execute()
 
         logger.info(
             "Successfully extracted %s for %s (confidence=%.2f)",
@@ -185,7 +205,7 @@ async def process_document(
 
     except Exception as e:
         logger.error("Extraction failed for %s %s: %s", ticker, document_type, e)
-        client.table("company_documents").update({
+        client.table("reit_company_documents").update({
             "status": "failed",
         }).eq("id", document_id).execute()
         return False
@@ -206,6 +226,6 @@ async def process_document(
             logger.warning("Email alert failed (non-blocking): %s", e)
 
     # Mark as completed
-    client.table("company_documents").update({"status": "completed"}).eq("id", document_id).execute()
+    client.table("reit_company_documents").update({"status": "completed"}).eq("id", document_id).execute()
 
     return True
