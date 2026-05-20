@@ -544,6 +544,7 @@ async def process_detected_backlog():
         .select("id, company_id, source_url, document_type, document_date, title, created_at")
         .eq("status", "detected")
         .is_("raw_content", "null")
+        .gte("document_date", "2025-01-01")
         .order("document_date", desc=True)
         .limit(5)
         .execute()
