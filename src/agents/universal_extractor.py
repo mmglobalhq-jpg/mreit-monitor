@@ -17,6 +17,18 @@ from src.models.universal_schemas import UniversalExtraction
 
 logger = logging.getLogger("mreit-monitor.universal_extractor")
 
+_docling_converter = None
+
+
+def _get_docling_converter():
+    """Return a module-level DocumentConverter, loading models once per process."""
+    global _docling_converter
+    if _docling_converter is None:
+        from docling.document_converter import DocumentConverter
+        _docling_converter = DocumentConverter()
+        logger.info("docling DocumentConverter initialized")
+    return _docling_converter
+
 
 def _extract_pdf_text(content: bytes) -> str:
     """Extract text from PDF bytes. Tries docling first, falls back to pdfplumber."""
@@ -26,13 +38,12 @@ def _extract_pdf_text(content: bytes) -> str:
     try:
         import os
         import tempfile
-        from docling.document_converter import DocumentConverter
 
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp.write(content)
             tmp_path = tmp.name
         try:
-            converter = DocumentConverter()
+            converter = _get_docling_converter()
             result = converter.convert(tmp_path)
             text = result.document.export_to_markdown()
         finally:
