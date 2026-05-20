@@ -25,6 +25,24 @@ logging.basicConfig(
 logger = logging.getLogger("mreit-monitor")
 
 
+def _reset_stuck_extracting_documents() -> None:
+    """Reset documents stuck at 'extracting' back to 'detected' after an unclean shutdown."""
+    try:
+        from src.services.supabase_client import get_supabase_client
+        client = get_supabase_client()
+        result = (
+            client.table("reit_company_documents")
+            .update({"status": "detected"})
+            .eq("status", "extracting")
+            .execute()
+        )
+        count = len(result.data) if result.data else 0
+        if count:
+            logger.info("Startup recovery: reset %d stuck 'extracting' doc(s) back to 'detected'", count)
+    except Exception as e:
+        logger.warning("Startup recovery failed (non-blocking): %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -36,6 +54,7 @@ async def lifespan(app: FastAPI):
     from src.services.scheduler import start_scheduler, shutdown_scheduler
 
     logger.info("Starting mREIT Monitor...")
+    _reset_stuck_extracting_documents()
     scheduler = start_scheduler()
     logger.info(
         "Scheduler started. IR scrape: hourly Mon-Fri 6-20 ET. EDGAR check: daily %d:%02d %s",

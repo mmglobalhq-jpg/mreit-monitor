@@ -8,6 +8,7 @@ Universal document processor — full pipeline for non-ARMOUR documents.
 5. Send email alert
 """
 
+import asyncio
 import hashlib
 import logging
 from datetime import date
@@ -203,6 +204,13 @@ async def process_document(
             document_type, ticker, extraction.extraction_confidence,
         )
 
+    except asyncio.CancelledError:
+        # Service is shutting down mid-extraction — reset to detected so startup recovery re-queues it
+        try:
+            client.table("reit_company_documents").update({"status": "detected"}).eq("id", document_id).execute()
+        except Exception:
+            pass
+        raise
     except Exception as e:
         logger.error("Extraction failed for %s %s: %s", ticker, document_type, e)
         client.table("reit_company_documents").update({
