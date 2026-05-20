@@ -6,7 +6,6 @@ based on document_type and injects company context. Supports Claude, OpenAI,
 and Gemini models via the model_router.
 """
 
-import base64
 import json
 import logging
 
@@ -17,6 +16,47 @@ from src.config.settings import settings
 from src.models.universal_schemas import UniversalExtraction
 
 logger = logging.getLogger("mreit-monitor.universal_extractor")
+
+
+def _extract_pdf_text(content: bytes) -> str:
+    """Extract text from PDF bytes. Tries docling first, falls back to pdfplumber."""
+    import io
+
+    # Try docling — richer markdown with tables preserved
+    try:
+        import os
+        import tempfile
+        from docling.document_converter import DocumentConverter
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        try:
+            converter = DocumentConverter()
+            result = converter.convert(tmp_path)
+            text = result.document.export_to_markdown()
+        finally:
+            os.unlink(tmp_path)
+
+        if text.strip():
+            logger.debug("docling extracted %d chars from PDF", len(text))
+            return text
+        logger.warning("docling returned empty text — falling back to pdfplumber")
+    except Exception as e:
+        logger.warning("docling PDF extraction failed (%s) — falling back to pdfplumber", e)
+
+    # Fallback: pdfplumber
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            pages = [page.extract_text() or "" for page in pdf.pages]
+        text = "\n\n".join(p for p in pages if p.strip())
+        if text.strip():
+            return text
+        return "[PDF contained no extractable text]"
+    except Exception as e:
+        logger.warning("pdfplumber fallback also failed (%s)", e)
+        return content.decode("utf-8", errors="replace")
 
 
 def _build_extraction_request(
@@ -42,27 +82,17 @@ def _build_extraction_request(
     system_prompt = system_template.format(preamble=preamble)
 
     if is_pdf and isinstance(content, bytes):
-        pdf_b64 = base64.standard_b64encode(content).decode("utf-8")
-        user_content = [
-            {
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": pdf_b64,
-                },
-            },
-            {
-                "type": "text",
-                "text": user_template.format(
-                    company_name=company_config.name,
-                    ticker=_ticker_for(company_config),
-                    primary_focus=", ".join(company_config.primary_focus),
-                    content="[See attached PDF]",
-                    schema_json=schema_json,
-                ),
-            },
-        ]
+        # Extract text from PDF using docling (best quality) with pdfplumber fallback
+        text_content = _extract_pdf_text(content)
+        if len(text_content) > 200_000:
+            text_content = text_content[:200_000] + "\n\n[TRUNCATED]"
+        user_content = user_template.format(
+            company_name=company_config.name,
+            ticker=_ticker_for(company_config),
+            primary_focus=", ".join(company_config.primary_focus),
+            content=text_content,
+            schema_json=schema_json,
+        )
     else:
         text_content = content if isinstance(content, str) else content.decode("utf-8", errors="replace")
         if len(text_content) > 200_000:
