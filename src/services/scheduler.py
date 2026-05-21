@@ -210,7 +210,7 @@ async def poll_edgar_only():
             log_poll(company_id, "edgar", f"CIK:{cik}", new_filings=len(edgar_filings))
 
             if detected:
-                new_filings = await filter_new_filings(detected, company_id)
+                new_filings = filter_new_filings(detected, company_id)
                 total_new += len(new_filings)
 
                 for filing in new_filings:
@@ -406,7 +406,7 @@ async def poll_all_companies():
             # Phase 3: Filter to only new filings (dedup against DB)
             # ----------------------------------------------------------
             if detected:
-                new_filings = await filter_new_filings(detected, company_id)
+                new_filings = filter_new_filings(detected, company_id)
                 total_new += len(new_filings)
                 for filing in new_filings:
                     filing_details.append({
@@ -490,8 +490,6 @@ async def generate_scheduled_summaries():
 
     # Companies that have monthly updates (and thus monthly summaries)
     MONTHLY_SUMMARY_TICKERS = {"ARR"}
-    # Companies with optional lightweight monthly notes
-    OPTIONAL_MONTHLY_TICKERS = {"AGNC", "DX"}
 
     for company in companies:
         company_id = company["id"]
@@ -535,18 +533,38 @@ async def process_detected_backlog():
     from src.models.database import get_active_companies
     from src.parsers.universal_document_processor import process_document
     from src.services.supabase_client import get_supabase_client
-    from datetime import date as date_cls, datetime as datetime_cls, timezone
+    from datetime import date as date_cls, datetime as datetime_cls, timezone, timedelta
 
     client = get_supabase_client()
+    now_utc = datetime_cls.now(timezone.utc)
+
+    # Re-queue recently-failed documents for one automatic retry.
+    # Documents that failed extraction in the last 6 hours get reset to "detected"
+    # so the backlog picks them up again. After 6 hours they stay "failed" for
+    # manual review — prevents infinite retry loops on permanently broken URLs.
+    retry_cutoff = (now_utc - timedelta(hours=6)).isoformat()
+    retry_floor = (now_utc - timedelta(minutes=30)).isoformat()  # don't re-queue if failed < 30 min ago
+    failed_recent = (
+        client.table("reit_company_documents")
+        .select("id")
+        .eq("status", "failed")
+        .gte("created_at", retry_cutoff)
+        .lte("created_at", retry_floor)
+        .execute()
+    ).data
+    if failed_recent:
+        retry_ids = [r["id"] for r in failed_recent]
+        client.table("reit_company_documents").update({"status": "detected"}).in_("id", retry_ids).execute()
+        logger.info("Re-queued %d recently-failed document(s) for retry", len(retry_ids))
 
     pending = (
         client.table("reit_company_documents")
-        .select("id, company_id, source_url, document_type, document_date, title, created_at")
+        .select("id, company_id, source_url, document_type, document_date, title, created_at, fiscal_quarter, fiscal_year")
         .eq("status", "detected")
         .is_("raw_content", "null")
-        .gte("document_date", "2025-01-01")
+        .gte("document_date", "2023-01-01")
         .order("document_date", desc=True)
-        .limit(5)
+        .limit(20)
         .execute()
     ).data
 
@@ -557,10 +575,8 @@ async def process_detected_backlog():
     logger.info("Extraction backlog: processing %d detected document(s)", len(pending))
 
     companies = {c["id"]: c for c in get_active_companies()}
-    # company_id → True if the extracted doc was recently detected (new filing)
+    # company_id → per-doc info for newly detected filings (age <= 4h)
     new_extraction_companies: dict[str, dict] = {}
-
-    now_utc = datetime_cls.now(timezone.utc)
 
     for doc in pending:
         company_id = doc["company_id"]
@@ -612,37 +628,83 @@ async def process_detected_backlog():
                     " [new — will generate report]" if is_new else "",
                 )
                 if is_new and settings.summary_enabled:
-                    new_extraction_companies[company_id] = co
+                    if company_id not in new_extraction_companies:
+                        new_extraction_companies[company_id] = {"co": co, "docs": []}
+                    new_extraction_companies[company_id]["docs"].append({
+                        "document_type": doc["document_type"],
+                        "fiscal_quarter": doc.get("fiscal_quarter"),
+                        "fiscal_year": doc.get("fiscal_year"),
+                        "document_date": doc.get("document_date"),
+                    })
         except Exception as e:
             logger.error("Backlog extraction failed for %s %s: %s", ticker, doc["source_url"][:80], e)
 
     # Generate reports for newly detected documents only
     if new_extraction_companies:
         import asyncio
-        for company_id, co in new_extraction_companies.items():
-            asyncio.create_task(_maybe_generate_summary(company_id, co["name"], co["ticker"]))
+        for company_id, item in new_extraction_companies.items():
+            co = item["co"]
+            for doc_info in item["docs"]:
+                asyncio.create_task(_maybe_generate_summary(
+                    company_id, co["name"], co["ticker"],
+                    doc_info["document_type"],
+                    doc_info["fiscal_quarter"],
+                    doc_info["fiscal_year"],
+                    doc_info["document_date"],
+                ))
 
 
 
-async def _maybe_generate_summary(company_id: str, company_name: str, ticker: str):
-    """Fire summary generation for a company if warranted by recent extraction."""
-    from datetime import date as date_cls
-    from src.services.summary_service import generate_monthly_summary
+async def _maybe_generate_summary(
+    company_id: str,
+    company_name: str,
+    ticker: str,
+    document_type: str,
+    fiscal_quarter: int | None,
+    fiscal_year: int | None,
+    document_date: str | None,
+):
+    """Fire summary generation after a new extraction, using company-specific trigger rules."""
+    from src.services.summary_service import generate_monthly_summary, generate_quarterly_summary
+    from src.services.summary_trigger import should_generate_summary
 
-    today = date_cls.today()
-    # For companies with monthly updates (ARR), generate for the most recent month
-    # with a new extraction but no summary yet
-    MONTHLY_TICKERS = {"ARR"}
-    if ticker not in MONTHLY_TICKERS:
+    should, summary_type = should_generate_summary(
+        ticker=ticker,
+        document_type=document_type,
+        company_id=company_id,
+        fiscal_quarter=fiscal_quarter,
+        fiscal_year=fiscal_year,
+    )
+
+    if not should:
         return
 
     try:
-        month = today.month - 1 if today.month > 1 else 12
-        year = today.year if today.month > 1 else today.year - 1
-        logger.info("Auto-generating monthly summary for %s %d-%02d after extraction", ticker, year, month)
-        await generate_monthly_summary(company_id, company_name, ticker, year, month)
+        if summary_type == "monthly":
+            from datetime import date as date_cls
+            if document_date:
+                pub = date_cls.fromisoformat(document_date[:10])
+                month = pub.month - 1 if pub.month > 1 else 12
+                year = pub.year if pub.month > 1 else pub.year - 1
+            else:
+                today = date_cls.today()
+                month = today.month - 1 if today.month > 1 else 12
+                year = today.year if today.month > 1 else today.year - 1
+            logger.info("Auto-generating monthly summary for %s %d-%02d", ticker, year, month)
+            await generate_monthly_summary(company_id, company_name, ticker, year, month)
+
+        elif summary_type == "quarterly":
+            if not fiscal_quarter or not fiscal_year:
+                logger.warning(
+                    "Cannot auto-generate quarterly summary for %s — missing fiscal_quarter/fiscal_year on document",
+                    ticker,
+                )
+                return
+            logger.info("Auto-generating quarterly summary for %s Q%d %d", ticker, fiscal_quarter, fiscal_year)
+            await generate_quarterly_summary(company_id, company_name, ticker, fiscal_year, fiscal_quarter)
+
     except Exception as e:
-        logger.error("Auto summary generation failed for %s: %s", ticker, e)
+        logger.error("Auto summary generation failed for %s (%s): %s", ticker, summary_type, e)
 
 
 async def send_new_filing_notification(total_new: int, filing_details: list[dict]):
@@ -742,10 +804,11 @@ def start_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=120,
     )
 
-    # Daily at 8:30 AM ET: generate scheduled summaries (monthly/quarterly/annual)
+    # Daily at 10:00 AM ET: generate scheduled summaries (monthly/quarterly/annual)
+    # Fires after the morning backlog run (every 15 min) has had time to finish extractions.
     scheduler.add_job(
         generate_scheduled_summaries,
-        CronTrigger(hour=8, minute=30, timezone="US/Eastern"),
+        CronTrigger(hour=10, minute=0, timezone="US/Eastern"),
         id="daily_summary_check",
         name="Daily summary generation check",
         replace_existing=True,

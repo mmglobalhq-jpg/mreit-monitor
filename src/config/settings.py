@@ -19,9 +19,9 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # Model selection via OpenRouter model IDs
-    extraction_model: str = "anthropic/claude-sonnet-4.6"
-    comparison_model: str = "anthropic/claude-sonnet-4.6"
-    summary_model: str = "anthropic/claude-sonnet-4.6"
+    extraction_model: str = "google/gemini-2.5-flash-lite"
+    comparison_model: str = "google/gemini-2.5-flash-lite"
+    summary_model: str = "google/gemini-2.5-flash-lite"
     max_extraction_retries: int = 3
 
     # Ollama — for IR page scraping and optional local extraction (local, free)
@@ -61,6 +61,18 @@ class Settings(BaseSettings):
     environment: str = "production"
     app_host: str = "127.0.0.1"
     app_port: int = 8012
+
+
+    def model_post_init(self, __context) -> None:
+        if not self.supabase_url.startswith("https://"):
+            raise ValueError(
+                f"SUPABASE_URL looks wrong: {self.supabase_url!r} — expected full URL starting with https://"
+            )
+        if not self.openrouter_api_key.startswith("sk-or-v1-"):
+            raise ValueError(
+                "OPENROUTER_API_KEY looks wrong (must start with sk-or-v1-) — "
+                "check for stale system env var overriding .env"
+            )
 
 
 settings = Settings()

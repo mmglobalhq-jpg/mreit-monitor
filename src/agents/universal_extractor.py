@@ -197,7 +197,7 @@ async def extract_document(
         model=model,
         system_prompt=system_prompt,
         user_content=user_content,
-        max_tokens=8192,
+        max_tokens=32768,
     )
 
     try:

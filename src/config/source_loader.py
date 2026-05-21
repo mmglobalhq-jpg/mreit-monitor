@@ -25,14 +25,16 @@ class DBScrapeSource:
 
 _SOURCE_TYPE_TO_DOC_TYPE: dict[str, str] = {
     "monthly_update": "monthly_update",
-    "quarterly_reports": "quarterly_earnings",
+    # annual_reports and quarterly_reports intentionally excluded — those come from EDGAR only
     "financial_results": "quarterly_earnings",
     "news": "press_release",
     "press_releases": "press_release",
-    "annual_reports": "annual_10k",
     "presentations": "investor_presentation",
     "upcoming_events": "investor_presentation",
+    "investor_relations": "investor_presentation",
+    "investor_presentation": "investor_presentation",
     "supplement": "financial_supplement",
+    "financial_supplement": "financial_supplement",
 }
 
 

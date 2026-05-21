@@ -132,6 +132,74 @@ def accession_from_edgar_url(source_url: str) -> tuple[str, str] | None:
     return cik_padded, accession
 
 
+async def fetch_recent_n_per_type(
+    cik: str,
+    form_types: list[str],
+    n: int = 4,
+) -> list["EdgarFiling"]:
+    """
+    Fetch the most recent N filings of each requested form type for a CIK.
+
+    Unlike check_new_filings, this ignores since_date and scans the full
+    recent submissions list, returning up to n results per form type.
+    """
+    url = EDGAR_SUBMISSIONS_URL.format(cik=cik)
+    headers = {
+        "User-Agent": settings.edgar_user_agent,
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+
+    data = response.json()
+    recent = data.get("filings", {}).get("recent", {})
+
+    forms = recent.get("form", [])
+    filing_dates = recent.get("filingDate", [])
+    accession_numbers = recent.get("accessionNumber", [])
+    primary_documents = recent.get("primaryDocument", [])
+    primary_doc_descriptions = recent.get("primaryDocDescription", [])
+
+    counts: dict[str, int] = {ft: 0 for ft in form_types}
+    results: list[EdgarFiling] = []
+
+    for i in range(len(forms)):
+        form_type = forms[i]
+        if form_type not in form_types:
+            continue
+        if counts[form_type] >= n:
+            continue
+
+        filing_date_str = filing_dates[i]
+        filing_dt = datetime.strptime(filing_date_str, "%Y-%m-%d").date()
+        accession = accession_numbers[i]
+        primary_doc = primary_documents[i]
+        accession_no_dashes = accession.replace("-", "")
+        doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik.lstrip('0')}/{accession_no_dashes}/{primary_doc}"
+
+        results.append(EdgarFiling(
+            accession_number=accession,
+            form_type=form_type,
+            filing_date=filing_dt,
+            primary_document=primary_doc,
+            primary_document_url=doc_url,
+            description=primary_doc_descriptions[i] if i < len(primary_doc_descriptions) else "",
+        ))
+        counts[form_type] += 1
+
+        if all(v >= n for v in counts.values()):
+            break
+
+    logger.info(
+        "fetch_recent_n_per_type CIK %s: %s",
+        cik,
+        ", ".join(f"{ft}×{counts[ft]}" for ft in form_types),
+    )
+    return results
+
+
 async def check_new_filings(
     cik: str,
     since_date: date | None = None,

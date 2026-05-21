@@ -89,9 +89,23 @@ def _parse_ir_page_with_bs4(html: str, page_url: str, doc_type: str) -> list[dic
     seen_urls: set[str] = set()
 
     DOC_KEYWORDS = [
-        "monthly", "update", "earnings", "quarterly", "10-q", "10-k", "8-k",
-        "press release", "investor presentation", "supplement", "financial",
-        "report", "filing", "results", "dividend", "portfolio",
+        "monthly", "update", "earnings",
+        "press release", "investor presentation", "supplement",
+        "results", "portfolio", "presentation",
+    ]
+
+    # Links matching these keywords are EDGAR-only — skip them on IR pages
+    EDGAR_EXCLUDE_KEYWORDS = [
+        "10-k", "10-q", "annual report", "proxy", "def 14a",
+        "form 10", "sec filing", "8-k",
+    ]
+
+    # Navigation / utility links that are never documents — skip regardless of other matches
+    NAV_EXCLUDE_KEYWORDS = [
+        "financial calculator", "dividend history", "stock information",
+        "stock price", "analyst coverage", "corporate governance",
+        "contact us", "email alerts", "rss feed", "events calendar",
+        "sec filings", "investor faq",
     ]
 
     DATE_PATTERNS = [
@@ -122,12 +136,25 @@ def _parse_ir_page_with_bs4(html: str, page_url: str, doc_type: str) -> list[dic
         if not is_doc_link:
             continue
 
-        context_text = text
-        parent = tag.parent
-        if parent:
-            context_text = parent.get_text(strip=True)
+        if any(kw in text.lower() for kw in EDGAR_EXCLUDE_KEYWORDS):
+            continue
 
-        doc_date = date_cls.today()
+        if any(kw in text.lower() for kw in NAV_EXCLUDE_KEYWORDS):
+            continue
+
+        # Build context by walking up to 3 ancestor elements to find a date
+        context_text = text
+        node = tag
+        for _ in range(3):
+            node = node.parent
+            if node is None:
+                break
+            context_text = node.get_text(separator=" ", strip=True)
+            # Stop walking up once we have enough text to search
+            if len(context_text) > 500:
+                break
+
+        doc_date = None
         period_label = ""
 
         for pattern in DATE_PATTERNS:
@@ -149,6 +176,11 @@ def _parse_ir_page_with_bs4(html: str, page_url: str, doc_type: str) -> list[dic
                     doc_date = date_cls(year, quarter * 3, 1)
                     period_label = f"Q{quarter} {year}"
                     break
+
+        # Only include links where we could extract a date — prevents archive pages
+        # from flooding the queue with undated historical links
+        if doc_date is None:
+            continue
 
         seen_urls.add(full_url)
         results.append({
@@ -199,6 +231,7 @@ async def scrape_ir_page(
 
     logger.info("Scraping %s for %s (%s)...", source.url, ticker, source.doc_type)
 
+    html = ""
     try:
         async with httpx.AsyncClient(
             follow_redirects=True,
@@ -207,11 +240,18 @@ async def scrape_ir_page(
         ) as client:
             response = await client.get(source.url)
             response.raise_for_status()
+            html = response.text
     except Exception as e:
-        logger.error("Failed to fetch %s: %s", source.url, e)
-        return []
-
-    html = response.text
+        logger.warning("httpx failed for %s (%s) — retrying with curl_cffi", source.url, e)
+        try:
+            from curl_cffi.requests import AsyncSession
+            async with AsyncSession(impersonate="chrome") as session:
+                resp = await session.get(source.url, timeout=30)
+                resp.raise_for_status()
+                html = resp.text
+        except Exception as e2:
+            logger.error("Failed to fetch %s: %s", source.url, e2)
+            return []
 
     try:
         raw_results = await _parse_ir_page(
@@ -249,6 +289,9 @@ async def scrape_ir_page(
             ))
         except Exception as e:
             logger.warning("Skipping invalid result from %s: %s", source.url, e)
+
+    # Only keep 2025+ documents — older items on archive pages are already ingested or not needed
+    detected = [d for d in detected if d.document_date.year >= 2025]
 
     logger.info("Found %d documents on %s for %s", len(detected), source.url, ticker)
     return detected

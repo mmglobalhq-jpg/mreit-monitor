@@ -65,6 +65,53 @@ def store_detected_document(
     logger.info("Stored detected document: %s %s (%s)", ticker, document_type, source_url[:80])
 
 
+async def _auto_generate_summary(
+    company_id: str,
+    company_name: str,
+    ticker: str,
+    document_type: str,
+    fiscal_quarter: int | None,
+    fiscal_year: int | None,
+    document_date: date | None,
+) -> None:
+    """Non-blocking summary trigger called after successful extraction."""
+    from src.services.summary_service import generate_monthly_summary, generate_quarterly_summary
+    from src.services.summary_trigger import should_generate_summary
+
+    should, summary_type = should_generate_summary(
+        ticker=ticker,
+        document_type=document_type,
+        company_id=company_id,
+        fiscal_quarter=fiscal_quarter,
+        fiscal_year=fiscal_year,
+    )
+    if not should:
+        return
+
+    try:
+        if summary_type == "monthly":
+            if document_date:
+                month = document_date.month - 1 if document_date.month > 1 else 12
+                year = document_date.year if document_date.month > 1 else document_date.year - 1
+            else:
+                from datetime import date as date_cls
+                today = date_cls.today()
+                month = today.month - 1 if today.month > 1 else 12
+                year = today.year if today.month > 1 else today.year - 1
+            logger.info("Auto-generating monthly summary for %s %d-%02d", ticker, year, month)
+            await generate_monthly_summary(company_id, company_name, ticker, year, month)
+
+        elif summary_type == "quarterly":
+            if not fiscal_quarter or not fiscal_year:
+                logger.warning("Cannot auto-generate quarterly summary for %s — missing fiscal info", ticker)
+                return
+            logger.info("Auto-generating quarterly summary for %s Q%d %d", ticker, fiscal_quarter, fiscal_year)
+            await generate_quarterly_summary(company_id, company_name, ticker, fiscal_year, fiscal_quarter)
+
+    except Exception as e:
+        logger.error("Auto summary generation failed for %s (%s): %s", ticker, summary_type, e)
+
+
 async def process_document(
     company_id: str,
     company_name: str,
@@ -76,6 +123,7 @@ async def process_document(
     period_label: str,
     title: str = "",
     skip_email: bool = False,
+    trigger_summary: bool = False,
 ) -> bool:
     """
     Full processing pipeline for a universal document.
@@ -89,6 +137,11 @@ async def process_document(
     # Step 1: Download the document
     logger.info("Downloading %s for %s: %s", document_type, ticker, source_url)
 
+    raw_content: bytes | str | None = None
+    content_type = ""
+    content_hash = ""
+    is_pdf = False
+
     try:
         async with httpx.AsyncClient(
             follow_redirects=True,
@@ -101,15 +154,34 @@ async def process_document(
         ) as http_client:
             response = await http_client.get(source_url)
             response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            is_pdf = "pdf" in content_type.lower() or source_url.lower().endswith(".pdf")
+            raw_content = response.content if is_pdf else response.text
     except Exception as e:
-        logger.error("Download failed for %s: %s", source_url, e)
+        logger.warning("httpx download failed for %s (%s) — retrying with curl_cffi", source_url, e)
+        try:
+            from curl_cffi.requests import AsyncSession
+            async with AsyncSession(impersonate="chrome") as session:
+                resp = await session.get(
+                    source_url,
+                    headers={"Referer": "/".join(source_url.split("/")[:3]) + "/"},
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                content_type = resp.headers.get("content-type", "")
+                is_pdf = "pdf" in content_type.lower() or source_url.lower().endswith(".pdf")
+                raw_content = resp.content if is_pdf else resp.text
+                logger.info("curl_cffi download succeeded for %s (%d bytes)", source_url, len(resp.content))
+        except Exception as e2:
+            logger.error("Download failed for %s: %s", source_url, e2)
+            return False
+
+    if not raw_content:
+        logger.error("Download failed for %s: empty content", source_url)
         return False
 
-    content_type = response.headers.get("content-type", "")
-    is_pdf = "pdf" in content_type.lower() or source_url.lower().endswith(".pdf")
-    raw_content = response.content if is_pdf else response.text
     content_hash = hashlib.sha256(
-        response.content if isinstance(response.content, bytes) else response.content.encode()
+        raw_content if isinstance(raw_content, bytes) else raw_content.encode()
     ).hexdigest()
 
     # Step 2: Store in documents table
@@ -172,9 +244,10 @@ async def process_document(
     if is_pdf:
         try:
             storage_path = f"documents/{ticker}/{document_type}/{document_date.isoformat()}.pdf"
+            pdf_bytes = raw_content if isinstance(raw_content, bytes) else raw_content.encode()
             client.storage.from_("filings").upload(
                 storage_path,
-                response.content,
+                pdf_bytes,
                 {"content-type": "application/pdf"},
             )
             client.table("reit_company_documents").update({"file_path": storage_path}).eq("id", document_id).execute()
@@ -235,5 +308,19 @@ async def process_document(
 
     # Mark as completed
     client.table("reit_company_documents").update({"status": "completed"}).eq("id", document_id).execute()
+
+    # Trigger summary generation if requested (non-blocking — fires and continues)
+    if trigger_summary:
+        from src.config.settings import settings as _settings
+        if _settings.summary_enabled:
+            asyncio.create_task(_auto_generate_summary(
+                company_id=company_id,
+                company_name=company_name,
+                ticker=ticker,
+                document_type=document_type,
+                fiscal_quarter=doc_row.get("fiscal_quarter"),
+                fiscal_year=doc_row.get("fiscal_year"),
+                document_date=document_date,
+            ))
 
     return True

@@ -205,6 +205,7 @@ async def trigger_extract(request: ExtractRequest):
         document_type=request.document_type,
         document_date=datetime.utcnow().date(),
         period_label="Manual Extraction",
+        trigger_summary=True,
     )
 
     return TriggerResponse(
@@ -348,6 +349,82 @@ async def trigger_backfill(ticker: str):
         message=f"Backfill started for {ticker.upper()} in background",
         filings_found=0,
     )
+
+
+# ============================================================================
+# EDGAR Seed — populate clean tables with last N filings per form type
+# ============================================================================
+
+@router.post("/trigger/seed-edgar", dependencies=[Depends(require_api_key)])
+async def trigger_seed_edgar(limit: int = 4):
+    """
+    Seed reit_company_documents with the last `limit` EDGAR filings of each
+    form type (8-K, 10-Q, 10-K) for every active company.
+
+    Safe to run on an empty table or a populated one — URL-based unique
+    constraint prevents duplicates.
+    """
+    from src.config.company_registry import get_company_config
+    from src.models.database import get_active_companies, log_poll
+    from src.services.edgar import fetch_recent_n_per_type
+    from src.parsers.universal_document_processor import store_detected_document
+
+    _FORM_DOC_TYPE = {
+        "8-K": "sec_filing",
+        "10-Q": "quarterly_10q",
+        "10-K": "annual_10k",
+        "10-K/A": "annual_10k",
+        "10-Q/A": "quarterly_10q",
+    }
+
+    companies = get_active_companies()
+    summary = []
+
+    for company in companies:
+        ticker = company["ticker"]
+        company_id = company["id"]
+        registry_config = get_company_config(ticker)
+        if not registry_config or not registry_config.cik:
+            logger.info("Skipping %s — no CIK configured", ticker)
+            continue
+
+        try:
+            filings = await fetch_recent_n_per_type(
+                cik=registry_config.cik,
+                form_types=["8-K", "10-Q", "10-K"],
+                n=limit,
+            )
+            added = 0
+            for ef in filings:
+                doc_type = _FORM_DOC_TYPE.get(ef.form_type, "sec_filing")
+                try:
+                    store_detected_document(
+                        company_id=company_id,
+                        ticker=ticker,
+                        source_url=ef.primary_document_url,
+                        document_type=doc_type,
+                        document_date=ef.filing_date,
+                        title=f"{ticker} {ef.form_type} {ef.filing_date.isoformat()}",
+                        period_label=f"{ef.form_type} {ef.filing_date.isoformat()}",
+                    )
+                    added += 1
+                except Exception as e:
+                    logger.warning("Skipped %s %s: %s", ticker, ef.accession_number, e)
+
+            log_poll(company_id, "edgar_seed", f"CIK:{registry_config.cik}", new_filings=added)
+            logger.info("Seeded %s: %d/%d stored", ticker, added, len(filings))
+            summary.append({"ticker": ticker, "found": len(filings), "added": added})
+
+        except Exception as e:
+            logger.error("Seed failed for %s: %s", ticker, e)
+            summary.append({"ticker": ticker, "found": 0, "added": 0, "error": str(e)})
+
+    total_added = sum(s["added"] for s in summary)
+    return {
+        "status": "ok",
+        "total_added": total_added,
+        "companies": summary,
+    }
 
 
 # ============================================================================
